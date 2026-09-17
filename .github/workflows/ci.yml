@@ -1,0 +1,62 @@
+name: CI & Model Smoke Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Syntax & Code Compilation
+      run: |
+        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py
+
+    - name: Smoke Test Model & Class Mappings
+      run: |
+        python -c "
+        import json, os, numpy as np, tensorflow as tf
+        from tensorflow.keras.models import load_model
+
+        # 1. Verify label mapping
+        assert os.path.exists('outputs/class_indices.json'), 'class_indices.json missing'
+        with open('outputs/class_indices.json') as f:
+            indices = json.load(f)
+        assert len(indices) == 7, f'Expected 7 classes, got {len(indices)}'
+
+        # 2. Verify model loads and predicts correctly
+        assert os.path.exists('model/emotion_model.keras'), 'Model file missing'
+        model = load_model('model/emotion_model.keras')
+        dummy_input = tf.zeros((1, 48, 48, 1))
+        preds = model(dummy_input, training=False).numpy()[0]
+        assert len(preds) == 7, f'Expected 7 output probabilities, got {len(preds)}'
+        assert abs(np.sum(preds) - 1.0) < 1e-3, 'Probabilities do not sum to 1.0'
+        print('[PASS] Model smoke test passed!')
+        "
+
+    - name: Smoke Test Web App Pipeline
+      run: |
+        python -c "
+        import app, numpy as np
+        dummy_img = np.zeros((200, 200, 3), dtype=np.uint8)
+        annotated, confs = app.predict_emotion(dummy_img)
+        assert len(confs) == 7, f'Expected 7 emotion confidences, got {len(confs)}'
+        print('[PASS] Gradio inference test passed!')
+        "
