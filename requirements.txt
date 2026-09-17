@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────────
+# EdgeVision: Facial Emotion Recognition & Fatigue Guard
+# Pinned Dependencies for Reproducibility & Hugging Face Spaces
+# ─────────────────────────────────────────────────────────────
+
+# Deep learning core
+tensorflow==2.16.2
+
+# Pinned for TensorFlow 2.16 C-API compatibility
+numpy==1.26.4
+
+# Computer vision
+opencv-python-headless==4.11.0.86
+
+# 3D Facial landmark & Eye Aspect Ratio (EAR) tracking
+mediapipe==1.0.1
+
+# Interactive web interface
+gradio==6.27.0
+
+# Evaluation, plotting, and interpretability
+matplotlib==3.10.8
+seaborn==0.13.2
+scikit-learn==1.8.0
