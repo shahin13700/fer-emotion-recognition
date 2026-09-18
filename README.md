@@ -37,6 +37,11 @@ Powered by a compact **MiniXception CNN** (~60,000 parameters, 817 KB) trained w
 - 🧠 **Explainable AI (Grad-CAM):** Visualizes neural network activation heatmaps to verify that predictions rely on valid facial action units.
 - 🌐 **Interactive Web App (Gradio):** Multi-modal web UI with live streaming, video processing, and photo booth, ready for **Hugging Face Spaces**.
 
+### 📸 Gamified Photo Booth Session Strip
+Unlock all 7 facial expressions to generate a downloadable high-resolution session card:
+
+![Emotion Photo Strip](assets/sample_photo_strip.png)
+
 ---
 
 ## 📊 Benchmark Evaluation & Empirical Thresholds

@@ -414,10 +414,10 @@ def generate_photo_strip(booth_state):
     draw = ImageDraw.Draw(canvas)
 
     # Header
-    draw.text((pad + 10, 18), "🎭 EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255))
-    date_str = datetime.datetime.now().strftime("%B %d, %Y • %H:%M")
+    draw.text((pad + 10, 18), "EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255))
+    date_str = datetime.datetime.now().strftime("%B %d, %Y - %H:%M")
     unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR)
-    draw.text((pad + 10, 44), f"Session Highlights • Score: {unlocked_count}/7 Emotions Unlocked • {date_str}", fill=(180, 180, 180))
+    draw.text((pad + 10, 44), f"Session Highlights | Score: {unlocked_count}/7 Emotions Unlocked | {date_str}", fill=(180, 180, 180))
 
     # Render 7 Emotion Tiles + 1 Summary Tile in a 4x2 grid
     positions = [
@@ -425,8 +425,8 @@ def generate_photo_strip(booth_state):
         (0, 1), (1, 1), (2, 1), (3, 1)  # Row 2: Angry, Fear, Disgust, Summary
     ]
 
-    for idx, emotion in enumerate(emotion_labels):
-        col, row = positions[idx]
+    for i, emotion in enumerate(emotion_labels):
+        col, row = positions[i]
         tx = pad + col * (tile_w + pad)
         ty = header_h + pad + row * (tile_h + pad)
 
@@ -449,7 +449,7 @@ def generate_photo_strip(booth_state):
             draw.text((tx + 12, ty + tile_h - 26), label_caption, fill=(255, 255, 255))
         else:
             # Locked slot placeholder
-            draw.text((tx + 30, ty + tile_h // 2 - 20), f"🔒 {emotion.upper()}", fill=(120, 130, 145))
+            draw.text((tx + 30, ty + tile_h // 2 - 20), f"[LOCKED] {emotion.upper()}", fill=(120, 130, 145))
             draw.text((tx + 30, ty + tile_h // 2 + 6), "Not captured yet", fill=(80, 90, 105))
 
     # Slot 8: Summary / Signature Card
