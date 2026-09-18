@@ -61,6 +61,10 @@ EMPIRICAL_THRESHOLDS = {
     "Disgust":  0.50,   # Calibrated for live webcam viability (25th %ile = 70.7%)
 }
 
+# Responsive Live Webcam Capture Floor: Any confident emotion (>25% vs 14.3% random guess)
+# is immediately captured, and dynamically upgraded whenever you hit a higher personal best!
+MIN_CAPTURE_FLOOR = 0.25
+
 print(f"Loading model from {MODEL_PATH}...")
 model = load_model(MODEL_PATH)
 _ = model(tf.zeros((1, 48, 48, 1)), training=False)
@@ -201,13 +205,20 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         # Clean, bold badge above forehead
         font_scale = max(0.85, fw / 180.0)
         font_thick = max(2, int(font_scale * 2.2))
+        
+        # Responsive feedback: Emerald Green when confident enough to capture, Cyan otherwise
+        if top_conf >= MIN_CAPTURE_FLOOR:
+            badge_color = (113, 204, 46) # Emerald Green in BGR
+        else:
+            badge_color = box_color # Cyan
+
         label_text = f"{top_label.upper()} {top_conf*100:.0f}%"
 
         (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
         
         badge_top = max(0, y - text_h - 16)
         badge_bottom = y
-        cv2.rectangle(annotated, (x, badge_top), (x + text_w + 18, badge_bottom), box_color, -1)
+        cv2.rectangle(annotated, (x, badge_top), (x + text_w + 18, badge_bottom), badge_color, -1)
         cv2.putText(annotated, label_text, (x + 8, badge_bottom - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thick, cv2.LINE_AA)
 
@@ -248,10 +259,10 @@ def process_booth_frame(frame, booth_state):
     for info in face_infos:
         label = info["label"]
         score = info["score"]
-        gate = EMPIRICAL_THRESHOLDS.get(label, 0.40)
         
-        # Only record if score passes empirical 25th percentile gate and beats previous score
-        if score >= gate and score > booth_state[label]["score"]:
+        # Dynamic Peak Expression Tracker: record & upgrade whenever score exceeds noise floor
+        # and beats your previous personal best for this emotion!
+        if score >= MIN_CAPTURE_FLOOR and score > booth_state[label]["score"]:
             x, y, fw, fh = info["box"]
             pad_x = int(fw * 0.25)
             pad_y = int(fh * 0.25)
@@ -270,15 +281,15 @@ def process_booth_frame(frame, booth_state):
             }
             new_capture = True
 
-    # Challenge counter text based on empirical thresholds
-    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40)]
-    missing = [e for e in emotion_labels if booth_state[e]["score"] < EMPIRICAL_THRESHOLDS.get(e, 0.40)]
+    # Challenge counter text based on captured slots
+    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR]
+    missing = [e for e in emotion_labels if booth_state[e]["score"] < MIN_CAPTURE_FLOOR]
 
     if len(missing) == 0:
         status_text = "🎉 **CHALLENGE COMPLETE!** You unlocked all 7 emotions! Click **Generate Photo Strip** below!"
     else:
         missing_str = ", ".join(missing)
-        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Missing: **{missing_str}** — tips below)*"
+        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Next up: **{missing_str}** — make your best face!)*"
 
     # Format gallery items
     gallery_items = []
@@ -316,8 +327,8 @@ def use_sample_face(emotion, booth_state):
             "is_sample": True
         }
 
-    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40)]
-    missing = [e for e in emotion_labels if booth_state[e]["score"] < EMPIRICAL_THRESHOLDS.get(e, 0.40)]
+    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR]
+    missing = [e for e in emotion_labels if booth_state[e]["score"] < MIN_CAPTURE_FLOOR]
 
     if len(missing) == 0:
         status_text = "🎉 **CHALLENGE COMPLETE!** All 7 emotions filled! Click **Generate Photo Strip** below!"
@@ -351,7 +362,7 @@ def save_and_contribute(booth_state, consent_given):
 
     for emotion, data in booth_state.items():
         # Only save real captured faces (exclude benchmark fallback samples)
-        if data["crop"] is not None and not data.get("is_sample") and data["score"] >= EMPIRICAL_THRESHOLDS.get(emotion, 0.40):
+        if data["crop"] is not None and not data.get("is_sample") and data["score"] >= MIN_CAPTURE_FLOOR:
             emo_dir = os.path.join(USER_CONTRIB_DIR, emotion.lower())
             os.makedirs(emo_dir, exist_ok=True)
 
@@ -405,7 +416,7 @@ def generate_photo_strip(booth_state):
     # Header
     draw.text((pad + 10, 18), "🎭 EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255))
     date_str = datetime.datetime.now().strftime("%B %d, %Y • %H:%M")
-    unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40))
+    unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR)
     draw.text((pad + 10, 44), f"Session Highlights • Score: {unlocked_count}/7 Emotions Unlocked • {date_str}", fill=(180, 180, 180))
 
     # Render 7 Emotion Tiles + 1 Summary Tile in a 4x2 grid

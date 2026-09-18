@@ -349,3 +349,44 @@ def test_explain_samples_fallback():
     # Verify main runs without error
     explain.main()
     assert os.path.exists(os.path.join("outputs", "gradcam_samples", "gradcam_gallery.png"))
+
+
+def test_dynamic_peak_expression_tracking(monkeypatch):
+    """Verifies that booth captures at 25% noise floor and upgrades when beating personal best."""
+    state = app.init_booth_state()
+
+    # Create dummy 120x120 frame
+    frame = np.full((120, 120, 3), 128, dtype=np.uint8)
+
+    # 1. Mock face detection with low confidence (below 25%)
+    mock_faces_low = [{"label": "Surprise", "score": 0.20, "box": (10, 10, 50, 50)}]
+    monkeypatch.setattr(app, "annotate_frame", lambda f, s=None, alpha=0.7: (f, None, s, mock_faces_low))
+
+    _, banner, gallery, state_out = app.process_booth_frame(frame, state)
+    assert state_out["Surprise"]["score"] == 0.0
+    assert state_out["Surprise"]["crop"] is None
+
+    # 2. Mock face detection with 44% Surprise (exceeds 25% floor)
+    mock_faces_44 = [{"label": "Surprise", "score": 0.44, "box": (10, 10, 50, 50)}]
+    monkeypatch.setattr(app, "annotate_frame", lambda f, s=None, alpha=0.7: (f, None, s, mock_faces_44))
+
+    _, banner, gallery, state_out = app.process_booth_frame(frame, state_out)
+    assert state_out["Surprise"]["score"] == 0.44
+    assert state_out["Surprise"]["crop"] is not None
+    assert len(gallery) == 1
+
+    # 3. Mock higher score 62% Surprise -> upgrades personal best
+    mock_faces_62 = [{"label": "Surprise", "score": 0.62, "box": (10, 10, 50, 50)}]
+    monkeypatch.setattr(app, "annotate_frame", lambda f, s=None, alpha=0.7: (f, None, s, mock_faces_62))
+
+    _, banner, gallery, state_out = app.process_booth_frame(frame, state_out)
+    assert state_out["Surprise"]["score"] == 0.62
+    assert "Surprise: 62%" in gallery[0][1]
+
+    # 4. Mock lower score 50% Surprise -> does NOT downgrade personal best
+    mock_faces_50 = [{"label": "Surprise", "score": 0.50, "box": (10, 10, 50, 50)}]
+    monkeypatch.setattr(app, "annotate_frame", lambda f, s=None, alpha=0.7: (f, None, s, mock_faces_50))
+
+    _, banner, gallery, state_out = app.process_booth_frame(frame, state_out)
+    assert state_out["Surprise"]["score"] == 0.62
+
