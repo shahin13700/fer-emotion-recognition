@@ -5,12 +5,13 @@ Includes:
 2. 🎥 Live Streaming Webcam (Clean face tracking + live side panel bars)
 3. 🎬 Full Video File Processing (.mp4, .mov, .avi)
 4. 🖼️ Still Image Analysis
-5. 🌟 Active Learning & Community Flywheel (Empirical 25th %ile gates, append-only metadata.jsonl, benchmark fallbacks)
-Powered by MiniXception & Gradio. Ready for Hugging Face Spaces.
+5. 💾 Local Active Learning (personal dataset builder, append-only metadata.jsonl, benchmark fallbacks)
+Powered by MiniXception & Gradio. Ready for Hugging Face Spaces (face saving is disabled there by default).
 """
 
 import os
 import json
+import time
 import tempfile
 import datetime
 import cv2
@@ -25,9 +26,22 @@ import gradio as gr
 # -------------------------------------------------------------
 MODEL_PATH = 'model/emotion_model.keras'
 INDICES_PATH = 'outputs/class_indices.json'
+THRESHOLDS_PATH = 'outputs/empirical_thresholds.json'
 USER_CONTRIB_DIR = 'dataset/user_contributed'
 METADATA_JSONL = os.path.join(USER_CONTRIB_DIR, 'metadata.jsonl')
-COMMUNITY_GOAL = 250
+
+# Saving face crops writes biometric data to the disk of whatever machine runs this app.
+# That is fine on your own laptop, but on a shared deployment (Hugging Face Spaces sets
+# SPACE_ID) every visitor's faces would land on the server. Saving is therefore disabled
+# automatically on Spaces unless EDGEVISION_ALLOW_SAVE=1 is set explicitly.
+ALLOW_LOCAL_SAVE = os.environ.get("EDGEVISION_ALLOW_SAVE", "0" if os.environ.get("SPACE_ID") else "1") == "1"
+
+# Uploaded-video limits: uploads are processed frame-by-frame on the CPU, so cap the work
+# a single request can demand (roughly 60 s at 30 fps) and the upload size.
+MAX_VIDEO_FRAMES = int(os.environ.get("EDGEVISION_MAX_VIDEO_FRAMES", "1800"))
+MAX_UPLOAD_SIZE = os.environ.get("EDGEVISION_MAX_UPLOAD", "50mb")
+VIDEO_OUT_DIR = os.path.join(tempfile.gettempdir(), "edgevision_videos")
+VIDEO_OUT_TTL_SECONDS = 3600
 
 if not os.path.exists(INDICES_PATH):
     raise FileNotFoundError(f"Missing {INDICES_PATH}. Please train or copy outputs first.")
@@ -49,25 +63,54 @@ EMOTION_COLORS_RGB = {
     "Disgust": (230, 126, 34),    # Amber Orange
 }
 
-# Empirical confidence thresholds derived from the 25th percentile of correct
-# predictions across all 7,178 FER2013 test set images.
-EMPIRICAL_THRESHOLDS = {
-    "Happy":    0.70,   # 25th %ile = 71.4%
-    "Surprise": 0.65,   # 25th %ile = 68.6%
-    "Neutral":  0.46,   # 25th %ile = 46.1%
-    "Angry":    0.46,   # 25th %ile = 46.1%
-    "Fear":     0.38,   # 25th %ile = 38.6%
-    "Sad":      0.37,   # 25th %ile = 37.5%
-    "Disgust":  0.50,   # Calibrated for live webcam viability (25th %ile = 70.7%)
-}
+# Typical confidence per emotion: the 25th percentile of the model's confidence on
+# CORRECT FER2013 test predictions (outputs/empirical_thresholds.json, produced by
+# scripts/calc_percentiles.py). These are NOT capture gates; they are shown as a reference
+# for how confident the model usually is when it is right, and used as the nominal score
+# of benchmark fallback faces.
+def load_empirical_thresholds(path=THRESHOLDS_PATH):
+    fallback = {"Happy": 0.71, "Surprise": 0.69, "Neutral": 0.46, "Angry": 0.46,
+                "Fear": 0.39, "Sad": 0.37, "Disgust": 0.71}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        loaded = {k: round(float(v["p25"]), 2) for k, v in data.items() if "p25" in v}
+        if set(loaded) == set(fallback):
+            return loaded
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return fallback
 
-# Responsive Live Webcam Capture Floor: Any confident emotion (>25% vs 14.3% random guess)
-# is immediately captured, and dynamically upgraded whenever you hit a higher personal best!
+
+EMPIRICAL_THRESHOLDS = load_empirical_thresholds()
+
+# Photo Booth capture floor: any emotion above 25% (vs. 14.3% for a random guess) is
+# captured, and the slot is upgraded whenever a higher personal best comes along.
 MIN_CAPTURE_FLOOR = 0.25
+
+# Whole-image fallback in the photo tab is only for tiny pre-cropped faces
+# (FER2013 samples are 48x48). Larger images without a detected face are NOT classified.
+MAX_FALLBACK_SIZE = 128
 
 print(f"Loading model from {MODEL_PATH}...")
 model = load_model(MODEL_PATH)
-_ = model(tf.zeros((1, 48, 48, 1)), training=False)
+
+
+@tf.function(input_signature=[tf.TensorSpec(shape=(None, 48, 48, 1), dtype=tf.float32)])
+def _infer(batch):
+    return model(batch, training=False)
+
+
+def predict_probs(roi):
+    """
+    Runs the classifier on a (1, 48, 48, 1) float32 array and returns the 7 probabilities.
+    Uses a traced tf.function: eager model(...) calls cost ~25 ms per face on a desktop CPU,
+    the compiled graph ~2 ms, which is what makes real-time framerates possible.
+    """
+    return _infer(tf.convert_to_tensor(roi, dtype=tf.float32)).numpy()[0]
+
+
+_ = predict_probs(np.zeros((1, 48, 48, 1), dtype=np.float32))  # warm-up / trace
 print("Model initialized and ready.")
 
 cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
@@ -130,11 +173,18 @@ def get_local_dataset_stats():
                 pass
 
     ready_classes = sum(1 for cnt in per_class.values() if cnt >= 10)
-    status_md = (
-        f"### 💾 Local Active Learning: Personal Dataset Builder\n"
-        f"**`{total_count} Verified Faces Saved Locally`** • **`{ready_classes}/7 Classes Ready for Fine-Tuning (≥10 per class required)`**\n\n"
-        f"*Save your expressions from the Photo Booth to build a personal dataset, then run `python fine_tune.py` to adapt the model to your camera!*"
-    )
+    if ALLOW_LOCAL_SAVE:
+        status_md = (
+            f"### 💾 Local Active Learning: Personal Dataset Builder\n"
+            f"**`{total_count} Verified Faces Saved Locally`** • **`{ready_classes}/7 Classes Ready for Fine-Tuning (≥10 per class required)`**\n\n"
+            f"*Save your expressions from the Photo Booth to build a personal dataset, then run `python fine_tune.py` to adapt the model to your camera!*"
+        )
+    else:
+        status_md = (
+            "### 💾 Local Active Learning: Personal Dataset Builder\n"
+            "**Face saving is disabled on this shared deployment.** Nothing you capture here is written to disk. "
+            "Run the app on your own machine (`python app.py`) to build a personal dataset and fine-tune."
+        )
     return total_count, per_class, status_md
 
 # Backward compatibility alias
@@ -185,7 +235,7 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         roi = roi_gray.astype('float32') / 255.0
         roi = np.expand_dims(np.expand_dims(roi, axis=0), axis=-1)
 
-        raw_preds = model(tf.convert_to_tensor(roi), training=False).numpy()[0]
+        raw_preds = predict_probs(roi)
 
         # Apply EMA smoothing ONLY to primary face (idx == 0) to avoid multi-person cross-talk
         if idx == 0:
@@ -205,7 +255,7 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         # Clean, bold badge above forehead
         font_scale = max(0.85, fw / 180.0)
         font_thick = max(2, int(font_scale * 2.2))
-        
+
         # Responsive feedback: Emerald Green when confident enough to capture, Cyan otherwise
         if top_conf >= MIN_CAPTURE_FLOOR:
             badge_color = (113, 204, 46) # Emerald Green in BGR
@@ -215,7 +265,7 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         label_text = f"{top_label.upper()} {top_conf*100:.0f}%"
 
         (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-        
+
         badge_top = max(0, y - text_h - 16)
         badge_bottom = y
         cv2.rectangle(annotated, (x, badge_top), (x + text_w + 18, badge_bottom), badge_color, -1)
@@ -234,13 +284,14 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
 # -------------------------------------------------------------
 # 3. Photo Booth Logic & Active Learning Handlers
 # -------------------------------------------------------------
-def process_booth_frame(frame, booth_state):
+def process_booth_frame(frame, booth_state, ema_state=None):
     """
-    Analyzes frame in Photo Booth mode using empirical thresholds, saves new
-    peak expression crops, and updates challenge counter.
+    Analyzes frame in Photo Booth mode, tracks the primary face's peak expression
+    per emotion (EMA-smoothed across frames), and updates the challenge counter.
+    Returns (annotated_frame, status_md, gallery_items, booth_state, ema_state).
     """
     if frame is None:
-        return None, gr.skip(), gr.skip(), booth_state
+        return None, gr.skip(), gr.skip(), booth_state, ema_state
 
     if booth_state is None:
         booth_state = init_booth_state()
@@ -253,13 +304,15 @@ def process_booth_frame(frame, booth_state):
 
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     clean_bgr = frame_bgr.copy()
-    annotated_bgr, confs, _, face_infos = annotate_frame(frame_bgr)
+    annotated_bgr, confs, ema_state, face_infos = annotate_frame(frame_bgr, smoothed_preds=ema_state)
 
     new_capture = False
-    for info in face_infos:
+    # Only the primary (largest) face can fill the booth: bystanders in the background must
+    # not end up in your gallery or, worse, in your personal fine-tuning dataset.
+    for info in face_infos[:1]:
         label = info["label"]
         score = info["score"]
-        
+
         # Dynamic Peak Expression Tracker: record & upgrade whenever score exceeds noise floor
         # and beats your previous personal best for this emotion!
         if score >= MIN_CAPTURE_FLOOR and score > booth_state[label]["score"]:
@@ -270,10 +323,10 @@ def process_booth_frame(frame, booth_state):
             y1 = max(0, y - pad_y)
             x2 = min(clean_bgr.shape[1], x + fw + pad_x)
             y2 = min(clean_bgr.shape[0], y + fh + pad_y)
-            
+
             crop_bgr = clean_bgr[y1:y2, x1:x2]
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-            
+
             booth_state[label] = {
                 "score": float(score),
                 "crop": crop_rgb,
@@ -301,9 +354,9 @@ def process_booth_frame(frame, booth_state):
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
     if new_capture:
-        return annotated_rgb, status_text, gallery_items, booth_state
+        return annotated_rgb, status_text, gallery_items, booth_state, ema_state
     else:
-        return annotated_rgb, gr.skip(), gr.skip(), booth_state
+        return annotated_rgb, gr.skip(), gr.skip(), booth_state, ema_state
 
 
 def use_sample_face(emotion, booth_state):
@@ -350,6 +403,10 @@ def save_and_contribute(booth_state, consent_given):
     Local Active Learning: Appends verified facial crops to dataset/user_contributed/
     and logs metadata using append-only JSON Lines format.
     """
+    if not ALLOW_LOCAL_SAVE:
+        return ("🔒 Saving is disabled on this shared deployment, so your faces were **not** written anywhere. "
+                "Run `python app.py` on your own machine to build a personal dataset."), gr.skip()
+
     if not consent_given:
         return "⚠️ Please check the confirmation box to save your expressions locally.", gr.skip()
 
@@ -373,7 +430,7 @@ def save_and_contribute(booth_state, consent_given):
             crop_pil.save(img_path)
 
             log_entry = {
-                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "emotion": emotion.lower(),
                 "score": round(float(data["score"]), 4),
                 "image_path": img_path.replace("\\", "/"),
@@ -461,26 +518,30 @@ def generate_photo_strip(booth_state):
     draw.text((stx + 20, sty + 80), f"Result: {unlocked_count} of 7", fill=(255, 255, 255))
     grade = "PERFECT!" if unlocked_count == 7 else "EXPRESSIVE!" if unlocked_count >= 5 else "NICE TRY!"
     draw.text((stx + 20, sty + 115), f"Grade: {grade}", fill=(46, 204, 113))
-    draw.text((stx + 20, sty + 170), "MiniXception 817 KB", fill=(150, 150, 150))
-    draw.text((stx + 20, sty + 195), "60+ FPS Real-Time Edge", fill=(100, 100, 100))
+    draw.text((stx + 20, sty + 170), "MiniXception 51k params / 817 KB", fill=(150, 150, 150))
+    draw.text((stx + 20, sty + 195), "Real-Time CPU Inference", fill=(100, 100, 100))
 
     return canvas
 
 
 def reset_booth():
-    """Resets the Photo Booth state and clear gallery."""
+    """Resets the Photo Booth state, the EMA smoother, and clears the gallery."""
     new_state = init_booth_state()
     status_text = "🎯 **Challenge:** 0 / 7 Emotions Captured! Start the camera and make your best expressions!"
-    return new_state, status_text, []
+    return new_state, status_text, [], None
 
 
 # -------------------------------------------------------------
 # 4. Standard Video & Image Handlers
 # -------------------------------------------------------------
-def process_live_frame(frame):
-    """Clean stream mode: outputs frame and updates side panel."""
+def process_live_frame(frame, ema_state=None):
+    """
+    Clean stream mode: outputs the annotated frame, the side-panel probabilities, and the
+    updated EMA state. The smoother lives in a per-session gr.State because each stream
+    callback is otherwise stateless; without it the label flickers frame to frame.
+    """
     if frame is None:
-        return None, {}
+        return None, {}, ema_state
     h, w, _ = frame.shape
     if w > 640:
         new_w = 640
@@ -488,36 +549,43 @@ def process_live_frame(frame):
         frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    annotated_bgr, confs, _, _ = annotate_frame(frame_bgr)
-    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs
+    annotated_bgr, confs, ema_state, _ = annotate_frame(frame_bgr, smoothed_preds=ema_state)
+    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs, ema_state
 
 
 def process_image(input_image):
-    """Processes a single uploaded image."""
+    """
+    Processes a single uploaded image.
+    Returns (annotated_rgb, confidences, status_markdown).
+    """
     if input_image is None:
-        return None, {}
+        return None, {}, ""
     frame_bgr = cv2.cvtColor(input_image, cv2.COLOR_RGB2BGR)
     annotated_bgr, confs, _, face_infos = annotate_frame(frame_bgr)
+    status = f"✅ {len(face_infos)} face(s) detected." if face_infos else "❌ No face detected."
 
-    # Fallback for tight headshots / pre-cropped faces (e.g. FER2013 48x48 samples) where Haar finds 0 faces
+    # Fallback ONLY for tiny pre-cropped faces (e.g. FER2013 48x48 samples) where Haar cannot fire.
+    # Larger images are not classified: the model has no "not a face" class and will happily
+    # assign an emotion to a cat, a logo, or random noise.
     if len(confs) == 0:
         h, w, _ = frame_bgr.shape
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         aspect_ratio = w / float(h)
-        # Check that image is not blank/flat and has portrait/square avatar aspect ratio
-        if 0.65 <= aspect_ratio <= 1.55 and float(np.std(gray)) > 15.0 and max(h, w) <= 500:
+        if 0.65 <= aspect_ratio <= 1.55 and float(np.std(gray)) > 15.0 and max(h, w) <= MAX_FALLBACK_SIZE:
             roi_gray = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA)
             roi = roi_gray.astype('float32') / 255.0
             roi = np.expand_dims(np.expand_dims(roi, axis=0), axis=-1)
-            raw_preds = model(tf.convert_to_tensor(roi), training=False).numpy()[0]
+            raw_preds = predict_probs(roi)
             confs = {emotion_labels[i]: float(raw_preds[i]) for i in range(len(emotion_labels))}
+            status = (f"⚠️ No face detected by the Haar cascade; the whole {w}×{h} image was treated as a "
+                      f"pre-cropped face (fallback only applies to images ≤ {MAX_FALLBACK_SIZE}px).")
 
             top_idx = int(np.argmax(raw_preds))
             top_label = emotion_labels[top_idx]
             top_conf = raw_preds[top_idx]
 
             annotated_bgr = frame_bgr.copy()
-            box_color = (0, 230, 255)
+            box_color = (0, 165, 255)  # Orange: fallback path, not a detection
             cv2.rectangle(annotated_bgr, (0, 0), (w - 1, h - 1), box_color, 2)
             label_text = f"{top_label.upper()} {top_conf*100:.0f}%"
             font_scale = max(0.45, w / 160.0)
@@ -528,14 +596,33 @@ def process_image(input_image):
             cv2.putText(annotated_bgr, label_text, (4, h - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thick, cv2.LINE_AA)
 
-    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs
+    return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs, status
 
-# Backward compatibility alias for test suites and CI smoke tests
-predict_emotion = process_image
+
+def predict_emotion(input_image):
+    """Backward-compatible (annotated, confidences) wrapper used by CI smoke tests."""
+    annotated, confs, _ = process_image(input_image)
+    return annotated, confs
+
+
+def _cleanup_old_videos(out_dir=VIDEO_OUT_DIR, ttl=VIDEO_OUT_TTL_SECONDS):
+    """Deletes annotated videos older than ttl seconds so the temp dir does not grow forever."""
+    try:
+        now = time.time()
+        for name in os.listdir(out_dir):
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path) and now - os.path.getmtime(path) > ttl:
+                os.remove(path)
+    except OSError:
+        pass
 
 
 def process_video_file(video_path, progress=gr.Progress()):
-    """Processes an uploaded video file frame-by-frame and returns annotated MP4."""
+    """
+    Processes an uploaded video file frame-by-frame and returns an annotated MP4.
+    Work per request is bounded: frames are downscaled to <=640px wide and at most
+    MAX_VIDEO_FRAMES are processed (the rest of the clip is dropped).
+    """
     if not video_path:
         return None
 
@@ -545,14 +632,23 @@ def process_video_file(video_path, progress=gr.Progress()):
 
     try:
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise gr.Error("Could not open the uploaded video.")
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if src_w <= 0 or src_h <= 0:
+            raise gr.Error("Could not read the video dimensions.")
+        scale = min(1.0, 640.0 / src_w)
+        width, height = int(src_w * scale), int(src_h * scale)
+        frames_to_process = min(total_frames, MAX_VIDEO_FRAMES)
 
-        temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        os.makedirs(VIDEO_OUT_DIR, exist_ok=True)
+        _cleanup_old_videos()
+        temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=VIDEO_OUT_DIR)
         temp_out.close()
-        
+
         # Try browser-friendly AVC/H.264 codecs first, fallback to mp4v
         codecs_to_try = ['avc1', 'H264', 'mp4v']
         out = None
@@ -575,17 +671,22 @@ def process_video_file(video_path, progress=gr.Progress()):
         smoothed_preds = None
         frame_idx = 0
 
-        while True:
+        while frame_idx < MAX_VIDEO_FRAMES:
             ret, frame = cap.read()
             if not ret:
                 break
-                
+            if scale < 1.0:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
             annotated_bgr, _, smoothed_preds, _ = annotate_frame(frame, smoothed_preds=smoothed_preds)
             out.write(annotated_bgr)
-            
+
             frame_idx += 1
             if frame_idx % 10 == 0:
-                progress(min(1.0, frame_idx / total_frames), desc=f"Processing video frame {frame_idx}/{total_frames}")
+                progress(min(1.0, frame_idx / frames_to_process), desc=f"Processing video frame {frame_idx}/{frames_to_process}")
+
+        if total_frames > MAX_VIDEO_FRAMES:
+            gr.Warning(f"Only the first {MAX_VIDEO_FRAMES} frames were processed (upload limit).")
 
         return temp_out.name
     except Exception as e:
@@ -619,12 +720,14 @@ custom_css = """
 
 with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as demo:
     booth_state = gr.State(value=init_booth_state)
+    booth_ema = gr.State(value=None)
+    live_ema = gr.State(value=None)
 
     gr.Markdown(
         """
         # 🎭 EdgeVision: Facial Emotion Recognition & Photo Booth
-        ### Real-Time Deep Learning using MiniXception (817 KB, 60+ FPS on CPU)
-        
+        ### Real-Time Deep Learning using MiniXception (51k parameters, 817 KB, CPU-only)
+
         [![GitHub](https://img.shields.io/badge/GitHub-Repository-black?logo=github)](https://github.com/shahin13700/fer-emotion-recognition)
         [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
         [![Model Size](https://img.shields.io/badge/Model%20Size-817%20KB-brightgreen)]()
@@ -641,7 +744,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
             gr.Markdown(
                 """
                 ### 🎮 The 7-Emotion Photo Booth Challenge
-                Turn on your camera and make your best facial expressions! The AI dynamically tracks your peak moments using **empirical confidence gates**, captures your best portraits, and compiles an **Emotion Photo Strip**!
+                Turn on your camera and make your best facial expressions! Any emotion the model scores above **25%** is captured, and each slot is upgraded whenever you beat your personal best. Then compile your **Emotion Photo Strip**!
                 """
             )
             challenge_badge = gr.Markdown("🎯 **Challenge:** 0 / 7 Emotions Captured! Start the camera and make your best faces!")
@@ -661,15 +764,17 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                     # Helpful Emoji Tips Accordion
                     with gr.Accordion("🎭 Facial Action Unit (AU) Guide & Tips", open=False):
                         gr.Markdown(
-                            """
-                            - 😊 **Happy (Gate: 70%):** Smile broadly, show teeth, and raise your cheeks.
-                            - 😲 **Surprise (Gate: 65%):** Drop jaw open wide and raise both eyebrows high.
-                            - 😐 **Neutral (Gate: 46%):** Relax all facial muscles with mouth gently closed.
-                            - 😡 **Angry (Gate: 46%):** Furrow and pull eyebrows down/together, compress lips.
-                            - 😢 **Sad (Gate: 37%):** Lower the corners of your mouth and cast gaze downward.
-                            - 😱 **Fear (Gate: 38%):** Widen eyes, raise inner eyebrows, pull head back slightly.
-                            - 🤢 **Disgust (Gate: 50%):** Wrinkle the bridge of your nose and raise upper lip.
-                            """
+                            "Capture floor is 25% for every emotion. The percentage after each emotion is the model's "
+                            "*typical* confidence when it is right on FER2013 (25th percentile), so you know what a strong score looks like.\n\n"
+                            + "\n".join([
+                                f"- 😊 **Happy (typical: {EMPIRICAL_THRESHOLDS['Happy']*100:.0f}%):** Smile broadly, show teeth, and raise your cheeks.",
+                                f"- 😲 **Surprise (typical: {EMPIRICAL_THRESHOLDS['Surprise']*100:.0f}%):** Drop jaw open wide and raise both eyebrows high.",
+                                f"- 😐 **Neutral (typical: {EMPIRICAL_THRESHOLDS['Neutral']*100:.0f}%):** Relax all facial muscles with mouth gently closed.",
+                                f"- 😡 **Angry (typical: {EMPIRICAL_THRESHOLDS['Angry']*100:.0f}%):** Furrow and pull eyebrows down/together, compress lips.",
+                                f"- 😢 **Sad (typical: {EMPIRICAL_THRESHOLDS['Sad']*100:.0f}%):** Lower the corners of your mouth and cast gaze downward.",
+                                f"- 😱 **Fear (typical: {EMPIRICAL_THRESHOLDS['Fear']*100:.0f}%):** Widen eyes, raise inner eyebrows, pull head back slightly.",
+                                f"- 🤢 **Disgust (typical: {EMPIRICAL_THRESHOLDS['Disgust']*100:.0f}%):** Wrinkle the bridge of your nose and raise upper lip.",
+                            ])
                         )
 
                 with gr.Column(scale=3):
@@ -680,19 +785,25 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                     # Active Learning Contribution Box
                     with gr.Group():
                         gr.Markdown("#### 💾 Personal Dataset Builder for Fine-Tuning")
-                        consent_box = gr.Checkbox(
-                            label="Save captured face crops to dataset/user_contributed/ (stored locally on your machine for fine_tune.py)",
-                            value=False
+                        gr.Markdown(
+                            "🔒 **Privacy:** face crops are written to `dataset/user_contributed/` on the machine running this app "
+                            "and never uploaded anywhere by EdgeVision. Delete that folder to erase them. "
+                            + ("" if ALLOW_LOCAL_SAVE else "**Saving is disabled on this shared deployment.**")
                         )
-                        contribute_btn = gr.Button("💾 Save Captured Faces to Local Dataset", variant="secondary")
+                        consent_box = gr.Checkbox(
+                            label="I understand my face crops will be saved to disk on this machine for fine_tune.py",
+                            value=False,
+                            interactive=ALLOW_LOCAL_SAVE
+                        )
+                        contribute_btn = gr.Button("💾 Save Captured Faces to Local Dataset", variant="secondary", interactive=ALLOW_LOCAL_SAVE)
                         contribute_feedback = gr.Markdown("")
 
 
             # Event bindings
             booth_stream.stream(
                 fn=process_booth_frame,
-                inputs=[booth_stream, booth_state],
-                outputs=[booth_stream, challenge_badge, gallery_output, booth_state]
+                inputs=[booth_stream, booth_state, booth_ema],
+                outputs=[booth_stream, challenge_badge, gallery_output, booth_state, booth_ema]
             )
 
             disgust_sample_btn.click(
@@ -716,7 +827,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
             reset_btn.click(
                 fn=reset_booth,
                 inputs=[],
-                outputs=[booth_state, challenge_badge, gallery_output]
+                outputs=[booth_state, challenge_badge, gallery_output, booth_ema]
             )
 
             contribute_btn.click(
@@ -727,30 +838,30 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
 
         # TAB 2: Live Streaming Webcam (Clean Stream)
         with gr.TabItem("🎥 Live Streaming Webcam"):
-            gr.Markdown("Continuous, real-time emotion recognition with probability bars in the sidebar:")
+            gr.Markdown("Continuous, real-time emotion recognition with EMA temporal smoothing and probability bars in the sidebar:")
             with gr.Row():
                 with gr.Column(scale=3):
                     webcam_stream = gr.Image(sources=["webcam"], streaming=True, label="Live Camera Input")
                     webcam_out = gr.Image(label="Live Tracking Video")
                 with gr.Column(scale=2):
                     live_labels = gr.Label(num_top_classes=7, label="📊 Live Emotion Probabilities")
-            
+
             webcam_stream.stream(
                 fn=process_live_frame,
-                inputs=webcam_stream,
-                outputs=[webcam_out, live_labels]
+                inputs=[webcam_stream, live_ema],
+                outputs=[webcam_out, live_labels, live_ema]
             )
 
         # TAB 3: Upload Video File
         with gr.TabItem("🎬 Upload Video File"):
-            gr.Markdown("Upload any video clip (`.mp4`, `.mov`, `.avi`) to track emotions frame-by-frame with temporal smoothing:")
+            gr.Markdown(f"Upload a video clip (`.mp4`, `.mov`, `.avi`, up to {MAX_UPLOAD_SIZE}) to track emotions frame-by-frame with temporal smoothing. Clips are downscaled to 640px and the first {MAX_VIDEO_FRAMES} frames (~{MAX_VIDEO_FRAMES // 30} s at 30 fps) are processed:")
             with gr.Row():
                 with gr.Column(scale=1):
                     video_input = gr.Video(label="Input Video")
                     video_btn = gr.Button("🚀 Process Video", variant="primary", size="lg")
                 with gr.Column(scale=1):
                     video_output = gr.Video(label="Annotated Video with Emotion Tracking")
-            
+
             video_btn.click(
                 fn=process_video_file,
                 inputs=video_input,
@@ -766,17 +877,18 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                     image_btn = gr.Button("🔍 Analyze Photo", variant="primary", size="lg")
                 with gr.Column(scale=1):
                     image_output = gr.Image(label="Annotated Detection")
+                    image_status = gr.Markdown("")
                     label_output = gr.Label(num_top_classes=7, label="Emotion Probabilities")
 
             image_btn.click(
                 fn=process_image,
                 inputs=image_input,
-                outputs=[image_output, label_output]
+                outputs=[image_output, label_output, image_status]
             )
             image_input.change(
                 fn=process_image,
                 inputs=image_input,
-                outputs=[image_output, label_output]
+                outputs=[image_output, label_output, image_status]
             )
 
     gr.Markdown(
@@ -784,12 +896,12 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
         ---
         ### ⚡ Technical Details
         - **Model:** MiniXception with Depthwise Separable Convolutions & Residual Connections
-        - **Parameters:** ~60,000 (817 KB model file)
-        - **Inference Speed:** Sub-10ms per face on CPU
-        - **Active Learning:** Append-only JSONL logging with 25th percentile empirical confidence gating
+        - **Parameters:** 51,255 (817 KB model file) · 57.3% accuracy on the FER2013 test set
+        - **Inference:** ~2 ms per face on a desktop CPU (graph-compiled), plus Haar face detection
+        - **Active Learning:** Local, opt-in personal dataset with append-only JSONL logging
         - **Repository:** [github.com/shahin13700/fer-emotion-recognition](https://github.com/shahin13700/fer-emotion-recognition)
         """
     )
 
 if __name__ == '__main__':
-    demo.launch(css=custom_css, share=False)
+    demo.launch(css=custom_css, share=False, max_file_size=MAX_UPLOAD_SIZE)

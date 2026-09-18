@@ -29,7 +29,7 @@ Facial Emotion Recognition (FER) is the task of automatically identifying a pers
 **Structure:**
 - Total images: 35,887
 - Training set: 28,709 images
-- Test set: 3,589 images
+- Test set: 7,178 images (the Kaggle `msambare/fer2013` split merges the original public and private test sets)
 - Format: Grayscale, 48×48 pixels
 - Classes: 7 emotion categories
 
@@ -79,7 +79,7 @@ MiniXception was selected for this project based on Arriaga et al. (2017), who p
 | Stage 3 | Dropout(0.5) | Regularization |
 | Output | Dense(7, softmax) | 7-class probability distribution |
 
-L2 regularization (λ=0.01) was applied to Conv2D layers.
+L2 regularization (λ=0.01) was applied to the two stem Conv2D layers and the Dense classifier. The resulting model has 51,255 trainable parameters.
 
 ### Training Configuration
 
@@ -95,7 +95,7 @@ L2 regularization (λ=0.01) was applied to Conv2D layers.
 - **ReduceLROnPlateau** (factor=0.5, patience=5, min lr=1e-6)
 - **ModelCheckpoint** (saves best model by validation accuracy)
 
-Training stopped at **epoch 65** via EarlyStopping; best weights restored from epoch 55. The learning rate was reduced 4 times: 0.001 → 0.0005 → 0.00025 → 0.0000625 → 0.00003125.
+Training ran on Colab with EarlyStopping ending it well before the 100-epoch cap; the per-epoch log was not preserved, so epoch counts and the exact learning-rate schedule are not reported here.
 
 ---
 
@@ -105,35 +105,37 @@ Training stopped at **epoch 65** via EarlyStopping; best weights restored from e
 
 | Metric | Value |
 |--------|-------|
-| Test Accuracy | **57.15%** |
-| Macro F1-Score | 0.53 |
-| Weighted F1-Score | 0.56 |
+| Test Accuracy | **57.30%** |
+| Macro F1-Score | 0.54 |
+| Weighted F1-Score | 0.57 |
 | Total Test Samples | 7,178 |
+
+All results below are reproducible from the weights shipped in `model/emotion_model.keras` by running `evaluate.py`; they match `outputs/classification_report.txt`.
 
 ### Per-Class Performance
 
 | Emotion  | Precision | Recall | F1-Score | Support |
 |----------|-----------|--------|----------|---------|
 | Angry    | 0.45      | 0.54   | 0.49     | 958     |
-| Disgust  | 0.34      | 0.64   | 0.45     | 111     |
-| Fear     | 0.43      | 0.24   | 0.31     | 1,024   |
-| Happy    | 0.81      | 0.78   | **0.79** | 1,774   |
-| Neutral  | 0.48      | 0.63   | 0.54     | 1,233   |
-| Sad      | 0.48      | 0.40   | 0.43     | 1,247   |
-| Surprise | 0.68      | 0.71   | **0.70** | 831     |
+| Disgust  | 0.40      | 0.61   | 0.48     | 111     |
+| Fear     | 0.41      | 0.30   | 0.34     | 1,024   |
+| Happy    | 0.85      | 0.75   | **0.79** | 1,774   |
+| Neutral  | 0.49      | 0.61   | 0.55     | 1,233   |
+| Sad      | 0.48      | 0.42   | 0.45     | 1,247   |
+| Surprise | 0.67      | 0.75   | **0.71** | 831     |
 
 ### Key Observations from the Confusion Matrix
 
 **Best-performing classes:**
-- **Happy (78% recall):** The open-mouth smile and raised cheeks are visually distinctive.
-- **Surprise (71% recall):** Raised eyebrows combined with an open mouth create a unique pattern.
-- **Disgust (64% recall):** Despite only 111 training samples, class weights successfully forced the model to learn this class.
+- **Happy (75% recall, 85% precision):** The open-mouth smile and raised cheeks are visually distinctive.
+- **Surprise (75% recall):** Raised eyebrows combined with an open mouth create a unique pattern.
+- **Disgust (61% recall):** Despite only 111 test samples (436 in training), class weights forced the model to learn this class, at the cost of precision (40%): a quarter of true Disgust images are predicted Angry.
 
-**Most confused pairs:**
-- Sad → Neutral: 26% of sad samples predicted as neutral
-- Angry → Neutral: 18% of angry samples predicted as neutral
-- Sad ↔ Angry: 15% mutual confusion
-- Fear → nearly everything: only 24% recall, confused with surprise, neutral, and sad
+**Most confused pairs (row-normalized confusion matrix):**
+- Sad → Neutral: 23% of sad samples predicted as neutral; Sad → Angry another 15%
+- Angry → Neutral: 16% of angry samples predicted as neutral
+- Fear → Sad 21%, Fear → Angry 16%, Fear → Neutral 14%, Fear → Surprise 13%: with only 30% recall, Fear is the weakest class
+- Disgust → Angry: 25% of disgust samples predicted as angry
 
 ---
 
@@ -141,15 +143,15 @@ Training stopped at **epoch 65** via EarlyStopping; best weights restored from e
 
 ### Performance in Context
 
-A test accuracy of 57.15% is consistent with published MiniXception results on FER2013 and is competitive given the dataset's known label noise. Human-level accuracy on FER2013 is approximately 65%, meaning the model is performing within a reasonable margin of the theoretical ceiling for this dataset.
+A test accuracy of 57.3% is consistent with published MiniXception results on FER2013 and is competitive given the dataset's known label noise. Human-level accuracy on FER2013 is approximately 65%, meaning the model is performing within a reasonable margin of the theoretical ceiling for this dataset.
 
 ### Challenges and How They Were Addressed
 
 **Challenge 1 — Class Imbalance**
-Without intervention, rare emotions like Disgust (436 samples) would be completely ignored by the model. This was resolved using scikit-learn's `compute_class_weight('balanced')`, which computed per-class penalty weights. The result: Disgust achieved 64% recall despite being the smallest class.
+Without intervention, rare emotions like Disgust (436 samples) would be completely ignored by the model. This was resolved using scikit-learn's `compute_class_weight('balanced')`, which computed per-class penalty weights. The result: Disgust achieved 61% recall despite being the smallest class.
 
 **Challenge 2 — Fear Class Performance**
-Fear achieved only 24% recall, the worst of all classes. In static images, the expression of fear closely resembles surprise (wide eyes) and sometimes neutral or sad. Without temporal cues from video sequences, distinguishing fear from other emotions is inherently difficult — even for human annotators.
+Fear achieved only 30% recall, the worst of all classes. In static images, the expression of fear closely resembles surprise (wide eyes) and sometimes neutral or sad. Without temporal cues from video sequences, distinguishing fear from other emotions is inherently difficult — even for human annotators.
 
 **Challenge 3 — Label Noise in FER2013**
 The dataset was collected through automated web scraping and crowd-sourced labeling. Many images are mislabeled or ambiguous. This is a fundamental dataset limitation that cannot be resolved through model architecture changes alone — it places a hard ceiling on achievable accuracy.
@@ -159,7 +161,7 @@ Reading 35,000 images directly from Google Drive produced training steps of 38 s
 
 ### Live Demo Observations
 
-The trained model was deployed in a real-time webcam demo using OpenCV's Haar cascade face detector. Happy, surprised, and neutral were reliably recognized. Lighting conditions significantly affected face detection quality. The disgust bar rarely activated, which is consistent with its limited representation in training data relative to real-world expression frequency.
+The trained model was deployed in a real-time webcam demo using OpenCV's Haar cascade face detector, with the forward pass compiled via `tf.function` (about 2 ms per face on a desktop CPU versus roughly 25 ms for an eager call). Happy, surprised, and neutral were reliably recognized. Lighting conditions significantly affected face detection quality. The disgust bar rarely activated, which is consistent with its limited representation in training data relative to real-world expression frequency.
 
 ---
 

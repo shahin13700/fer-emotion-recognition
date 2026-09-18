@@ -14,58 +14,58 @@ license: mit
 
 [![CI](https://github.com/shahin13700/fer-emotion-recognition/actions/workflows/ci.yml/badge.svg)](https://github.com/shahin13700/fer-emotion-recognition/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.16-FF6F00?logo=tensorflow&logoColor=white)](https://tensorflow.org/)
-[![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10-007ACC?logo=google&logoColor=white)](https://developers.google.com/mediapipe)
+[![MediaPipe](https://img.shields.io/badge/MediaPipe-1.0-007ACC?logo=google&logoColor=white)](https://developers.google.com/mediapipe)
 [![Gradio](https://img.shields.io/badge/Gradio-Web%20App-orange?logo=gradio)](https://gradio.app/)
 [![Model Size](https://img.shields.io/badge/Model%20Size-817%20KB-brightgreen)]()
 
-An ultra-lightweight computer vision pipeline for **real-time facial emotion recognition**, **gamified peak expression tracking**, and **driver drowsiness monitoring** at 60+ FPS on consumer CPUs—requiring **zero GPU** for deployment.
+A lightweight, CPU-only computer vision pipeline for **real-time facial emotion recognition**, a **gamified photo booth**, and **driver drowsiness monitoring**. No GPU required.
 
-Powered by a compact **MiniXception CNN** (~60,000 parameters, 817 KB) trained with cost-sensitive class weights, stabilized by **Exponential Moving Average (EMA) temporal smoothing**, and integrated with **Google MediaPipe 3D Face Mesh** (468 landmarks).
+Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on FER2013 with class-balanced weights, stabilized by **Exponential Moving Average (EMA) temporal smoothing**, and paired with **Google MediaPipe Face Mesh** (468 landmarks) for eye-closure detection.
 
 ---
 
 ## 🌟 Key Features
 
-- ⚡ **Sub-10ms Edge Inference:** MiniXception uses depthwise separable convolutions to reduce parameters by ~8x compared to standard convolutions. Model size is only **817 KB**.
-- 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge that uses **Dynamic Peak Expression Tracking** (with a responsive 25% noise floor) to capture your personal best facial expressions across all 7 emotions, complete with real-time emerald capture feedback and a downloadable **Emotion Photo Strip**.
-- 💾 **Local Active Learning & Personal Dataset Builder:** Save verified webcam portraits locally to `dataset/user_contributed/metadata.jsonl` to tailor the model to your camera, lighting, and facial traits.
-- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Blended data generator that combines user data with base training data, enforces a minimum 10 samples/class gate, heavy data augmentation, and test set rollback protection if accuracy drops.
-- 👁️ **Fatigue & Drowsiness Guard:** Real-time **Eye Aspect Ratio (EAR)** calculation via 468 3D facial landmarks detects eye closure and micro-sleeps.
-- 🎯 **Temporal Smoothing:** Exponential Moving Average (EMA) across consecutive video frames eliminates erratic label flickering.
-- 🧠 **Explainable AI (Grad-CAM):** Visualizes neural network activation heatmaps to verify that predictions rely on valid facial action units.
-- 🌐 **Interactive Web App (Gradio):** Multi-modal web UI with live streaming, video processing, and photo booth, ready for **Hugging Face Spaces**.
+- ⚡ **Fast CPU Inference:** Depthwise separable convolutions keep the model at 51k parameters. The forward pass is graph-compiled (`tf.function`), so a face costs **~2 ms** and a full 640×480 frame (Haar detection + classification) **~5 ms** on a desktop CPU (measured on a Ryzen 5000; your webcam and browser will bound the real frame rate).
+- 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge with **peak expression tracking**: any emotion scored above a 25% floor is captured, and each slot upgrades whenever you beat your personal best. Produces a downloadable **Emotion Photo Strip**. Only the largest (primary) face in frame is tracked, so bystanders never end up in your strip.
+- 💾 **Local Active Learning & Personal Dataset Builder:** Opt-in saving of your captured faces to `dataset/user_contributed/` (with an append-only `metadata.jsonl`) so you can adapt the model to your camera, lighting, and face. **Automatically disabled on Hugging Face Spaces** so visitors' faces are never written to a shared server.
+- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Blends your faces into every training batch with augmentation, enforces a minimum of 10 samples per class, holds out 20% of your faces to measure personal improvement, and only promotes a model that does not regress on your held-out faces and stays within 1 pp on the FER2013 test set. Previous weights are always backed up.
+- 👁️ **Fatigue & Drowsiness Guard:** Real-time **Eye Aspect Ratio (EAR)** from MediaPipe landmarks flags sustained eye closure.
+- 🎯 **Temporal Smoothing:** EMA across consecutive frames in every live path (Gradio webcam tabs, `demo.py`, `monitor.py`, uploaded videos) reduces label flicker.
+- 🧠 **Explainable AI (Grad-CAM):** Coarse activation maps showing which region of the face drove a prediction.
+- 🌐 **Interactive Web App (Gradio):** Photo booth, live webcam, video upload, and still-image tabs, ready for **Hugging Face Spaces**.
 
-### 📸 Gamified Photo Booth Session Strip
-Unlock all 7 facial expressions to generate a downloadable high-resolution session card:
+### 📸 Photo Booth Session Strip
+The strip below was generated by the shipped code with the seven benchmark fallback faces (hence the `(SAMPLE)` tags and the reference scores); a live session shows your own captures and scores instead:
 
 ![Emotion Photo Strip](assets/sample_photo_strip.png)
 
 ---
 
-## 📊 Benchmark Evaluation & Empirical Thresholds
+## 📊 Benchmark Evaluation
 
-Evaluated on **7,178 test images** from the FER2013 benchmark dataset:
+Evaluated with `evaluate.py` on the **7,178-image FER2013 test set** (the Kaggle `msambare/fer2013` split). These numbers are produced by the exact weights in `model/emotion_model.keras`; see [`outputs/classification_report.txt`](outputs/classification_report.txt) and [`outputs/empirical_thresholds.json`](outputs/empirical_thresholds.json).
 
-| Emotion | Precision | Recall | F1-Score | Support | Live Capture Gate | Key Facial Signals |
+| Emotion | Precision | Recall | F1-Score | Support | Typical Confidence* | Key Facial Signals |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Happy** | **0.81** | **0.78** | **0.79** | 1,774 | **0.70** | Distinctive smile, raised cheeks |
-| **Surprise** | **0.68** | **0.71** | **0.70** | 831 | **0.65** | Raised eyebrows, open mouth |
-| **Disgust** | 0.34 | **0.64** | 0.45 | 111 | **0.50** | Wrinkled nose (class-weighted) |
-| **Neutral** | 0.48 | 0.63 | 0.54 | 1,233 | **0.46** | Resting facial posture |
-| **Angry** | 0.45 | 0.54 | 0.49 | 958 | **0.46** | Lowered eyebrows, tightened lips |
-| **Sad** | 0.48 | 0.40 | 0.43 | 1,247 | **0.37** | Downturned lip corners |
-| **Fear** | 0.43 | 0.24 | 0.31 | 1,024 | **0.38** | Widened eyes (often confused with Surprise) |
+| **Happy** | **0.85** | **0.75** | **0.79** | 1,774 | 0.71 | Distinctive smile, raised cheeks |
+| **Surprise** | **0.67** | **0.75** | **0.71** | 831 | 0.69 | Raised eyebrows, open mouth |
+| **Neutral** | 0.49 | 0.61 | 0.55 | 1,233 | 0.46 | Resting facial posture |
+| **Angry** | 0.45 | 0.54 | 0.49 | 958 | 0.46 | Lowered eyebrows, tightened lips |
+| **Disgust** | 0.40 | 0.61 | 0.48 | 111 | 0.71 | Wrinkled nose (class-weighted) |
+| **Sad** | 0.48 | 0.42 | 0.45 | 1,247 | 0.37 | Downturned lip corners; often predicted Neutral |
+| **Fear** | 0.41 | 0.30 | 0.34 | 1,024 | 0.39 | Widened eyes; confused with Sad, Angry, Surprise |
 
-- **Test Accuracy:** **57.15%** (Competitive baseline on FER2013 for a lightweight 60k parameter model).
-- **Capture Gates:** Derived from the 25th percentile of correct test predictions to calibrate webcam sensitivity per emotion.
+- **Test Accuracy:** **57.3%** (macro F1 0.54, weighted F1 0.57). This is in line with published MiniXception results on FER2013 for a ~50k-parameter model; human agreement on this dataset is roughly 65% because of label noise.
+- **\*Typical Confidence:** the 25th percentile of the model's confidence on *correct* test predictions (`scripts/calc_percentiles.py`). Shown in the app as a reference for what a strong score looks like; it is **not** a capture gate.
 
 ---
 
-## 🔬 Explainable AI: Grad-CAM Feature Attributions
+## 🔬 Explainable AI: Grad-CAM
 
-`explain.py` generates **Gradient-weighted Class Activation Mapping (Grad-CAM)** heatmaps to confirm the network focuses on biologically plausible facial regions (mouth corners for *Happy*, brow furrowing for *Angry*):
+`explain.py` generates Gradient-weighted Class Activation Maps from the last residual block. That block's feature map is **3×3**, so each heatmap is a coarse attribution grid upsampled to the 48×48 input: it tells you *which region* of the face contributed most, not fine detail. The gallery also flags misclassified samples (✗) rather than hiding them; on the seven bundled samples the model gets 4/7 right, consistent with its 57% test accuracy.
 
 ![Grad-CAM Gallery](outputs/gradcam_samples/gradcam_gallery.png)
 
@@ -78,7 +78,7 @@ Evaluated on **7,178 test images** from the FER2013 benchmark dataset:
 git clone https://github.com/shahin13700/fer-emotion-recognition.git
 cd fer-emotion-recognition
 
-# Create virtual environment
+# Create virtual environment (Python 3.11)
 python -m venv .venv
 source .venv/bin/activate       # On Linux/macOS
 .\.venv\Scripts\Activate.ps1    # On Windows
@@ -87,9 +87,7 @@ source .venv/bin/activate       # On Linux/macOS
 pip install -r requirements.txt
 ```
 
-*(Pre-trained weights are pre-packaged in `model/emotion_model.keras`—no initial training required!)*
-
----
+*(Pre-trained weights are included in `model/emotion_model.keras`, no training required. On Debian/Ubuntu without a desktop, `apt install libgl1 libglib2.0-0` for OpenCV; `packages.txt` does this on Hugging Face Spaces.)*
 
 ### 2. Available Scripts
 
@@ -99,7 +97,7 @@ pip install -r requirements.txt
   ```
   *Open `http://127.0.0.1:7860` in your browser.*
 
-* **Real-Time Live Webcam (Smoothed):**
+* **Real-Time Live Webcam (OpenCV window, EMA-smoothed):**
   ```bash
   python demo.py
   ```
@@ -114,68 +112,78 @@ pip install -r requirements.txt
   python explain.py
   ```
 
-* **Local Active Learning Fine-Tuning:**
+* **Local Active Learning Fine-Tuning** (requires FER2013 in `dataset/`, see below, plus ≥10 saved faces per class):
   ```bash
   python fine_tune.py
-  # Restore pristine original weights anytime:
+  # Restore the original weights anytime:
   python fine_tune.py --reset
   ```
 
-* **Retraining Base Model from Scratch (Optional):**
+* **Evaluate / Retrain the Base Model:**
   ```bash
-  # Download and unpack FER2013 if training from scratch
+  # Download and unpack FER2013 (needed by evaluate.py, fine_tune.py, train.py)
   kaggle datasets download -d msambare/fer2013
   unzip -q fer2013.zip -d dataset/
-  python train.py
+  python evaluate.py     # reproduces outputs/classification_report.txt
+  python train.py        # retrains from scratch (same architecture/regularization as the shipped model; results vary by run)
   ```
 
 ---
 
-## 🔮 Roadmap & Future Engineering
+## 🔒 Privacy
 
-Practical next steps for edge deployment:
+- The webcam tabs process frames in memory and store nothing unless you tick the consent box in the Photo Booth and click **Save**.
+- Saved crops go to `dataset/user_contributed/` on the machine running the app and are never uploaded by EdgeVision. Delete that folder to erase them. `dataset/` is git-ignored.
+- On Hugging Face Spaces (`SPACE_ID` set) saving is disabled by default because the "machine running the app" is a shared server. Set `EDGEVISION_ALLOW_SAVE=1` only on a private deployment you control.
+- Uploaded videos are capped (default 50 MB, first 1,800 frames, downscaled to 640 px) and the annotated outputs are purged after an hour. Tune with `EDGEVISION_MAX_UPLOAD` and `EDGEVISION_MAX_VIDEO_FRAMES`.
 
-1. ⚡ **ONNX Runtime & INT8 Quantization:** Convert `emotion_model.keras` to ONNX and INT8-quantized TFLite to benchmark sub-3ms latency on Raspberry Pi and CPU edge devices.
-2. 👁️ **3D Head Pose Filtering:** Integrate MediaPipe FaceMesh 6-DOF landmarks to filter out extreme off-angle faces before classification, reducing false positives in driver monitoring.
+---
+
+## 🔮 Roadmap
+
+1. ⚡ **ONNX Runtime & INT8 Quantization:** Export to ONNX / TFLite and benchmark on Raspberry Pi-class CPUs.
+2. 👁️ **3D Head Pose Filtering:** Use MediaPipe FaceMesh pose to reject extreme off-angle faces before classification.
+3. 🧪 **Cleaner data:** FER2013 label noise caps accuracy near 65%; RAF-DB or AffectNet would lift the ceiling.
 
 ---
 
 ## 📁 Repository Structure
 
 ```
-├── app.py                         # Gradio web app (Photo Booth, webcam, video, local active learning)
+├── app.py                         # Gradio web app (Photo Booth, webcam, video, image, local active learning)
 ├── fine_tune.py                   # Guardrailed active learning fine-tuning engine
-├── demo.py                        # Real-time webcam demo with EMA temporal smoothing
+├── demo.py                        # Real-time webcam demo with EMA temporal smoothing (OpenCV window)
 ├── monitor.py                     # MediaPipe Face Mesh + Drowsiness (EAR) monitor
 ├── explain.py                     # Grad-CAM Explainable AI generator
-├── train.py                       # Base model training script with class weights
+├── train.py                       # Base model training script (matches the shipped model's architecture)
 ├── evaluate.py                    # Evaluation suite & confusion matrix generator
+├── packages.txt                   # System packages for Hugging Face Spaces (libGL for OpenCV)
 ├── CONTRIBUTING.md                # Development setup & contribution guide
 ├── assets/
-│   └── samples/                   # High-quality benchmark sample faces for UI fallbacks
+│   ├── sample_photo_strip.png     # Strip generated from the benchmark fallback faces
+│   └── samples/                   # Seven 48x48 FER2013 test faces used as UI fallbacks
 ├── docs/
-│   └── academic_research_report.md # Comprehensive theoretical analysis & literature review
+│   └── academic_research_report.md # Course report (methodology, results, lessons learned)
 ├── notebooks/
-│   └── exploration_and_training.ipynb # Interactive exploration and training experiments
+│   └── exploration_and_training.ipynb # Colab notebook that produced the shipped weights
 ├── scripts/
-│   └── calc_percentiles.py        # Utility for computing empirical percentile cutoffs
+│   └── calc_percentiles.py        # Computes per-class typical-confidence percentiles
 ├── model/
-│   ├── emotion_model.keras        # Active trained model weights (817 KB)
-│   └── emotion_model_original.keras # Immutable ground truth baseline
+│   └── emotion_model.keras        # Trained weights (51,255 params, 817 KB); fine_tune.py backs up copies here
 ├── outputs/
 │   ├── class_indices.json         # Emotion class label index mapping
-│   ├── empirical_thresholds.json  # 25th percentile empirical confidence cutoffs
-│   └── gradcam_samples/           # Generated Grad-CAM visualization galleries
+│   ├── classification_report.txt  # evaluate.py output for the shipped weights
+│   ├── empirical_thresholds.json  # Per-class confidence percentiles on correct test predictions
+│   └── gradcam_samples/           # Grad-CAM gallery
 ├── tests/
-│   ├── __init__.py                # Test package initialization
-│   └── test_active_learning.py    # Automated test suite (17 tests)
+│   └── test_active_learning.py    # Automated test suite (30 tests)
 ├── requirements.txt               # Pinned Python package dependencies
-├── LICENSE                        # MIT License
+├── LICENSE                        # MIT License (code and weights)
 └── README.md
 ```
 
 ---
 
-## 📜 License
+## 📜 License & Data
 
-Distributed under the **MIT License**. See `LICENSE` for details.
+Code and trained weights are distributed under the **MIT License** (see `LICENSE`). The seven images in `assets/samples/` are 48×48 crops from the FER2013 test set, which was assembled from web image search results; they are included for demonstration only and are not covered by the MIT license.

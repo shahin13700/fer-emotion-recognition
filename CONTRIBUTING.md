@@ -29,6 +29,14 @@ pip install -r requirements.txt
 ```bash
 pytest tests/ -v
 ```
+The suite must leave `git status` clean; CI fails if a test writes into a tracked file. Write generated files to `tmp_path`.
+
+### 4. Optional: FER2013 for evaluation and fine-tuning
+`evaluate.py`, `fine_tune.py`, `train.py` and `scripts/calc_percentiles.py` need the dataset unpacked at `dataset/train` and `dataset/test` (git-ignored):
+```bash
+kaggle datasets download -d msambare/fer2013
+unzip -q fer2013.zip -d dataset/
+```
 
 ---
 
@@ -50,13 +58,16 @@ We are looking for contributions across these two practical edge engineering are
 ## 💾 Local Active Learning & Fine-Tuning
 
 EdgeVision includes a local active learning script for tailoring the model:
-1. Capture expressions in the Photo Booth (`python app.py`) and save them locally.
+1. Capture expressions in the Photo Booth (`python app.py`) and save them locally (≥10 per emotion).
 2. Contributed crops are saved to `dataset/user_contributed/` with metadata in `metadata.jsonl`.
-3. Run `python fine_tune.py` to audit volume and train with our blended data generator.
-4. If accuracy drops on the test set, weights remain protected. You can restore the pristine original baseline anytime with:
+3. Run `python fine_tune.py` to audit volume and train with the blended data generator. 20% of your faces are held out to measure whether the model actually improved on *you*.
+4. The candidate is promoted only if it does not regress on your held-out faces and stays within `--max_test_drop` (default 1 pp) on the FER2013 test set; the previous weights are backed up to `model/emotion_model_backup.keras`. Restore the original baseline anytime with:
    ```bash
    python fine_tune.py --reset
    ```
+
+### Claims in the README must be backed by an artifact
+Accuracy numbers come from `outputs/classification_report.txt` (regenerate with `evaluate.py`), the parameter count from the model file (checked in CI), and latency figures should state the CPU they were measured on.
 
 ---
 
@@ -71,4 +82,5 @@ EdgeVision includes a local active learning script for tailoring the model:
 3. **Testing:**
    - Run `pytest tests/ -v` and ensure all tests pass.
    - Run `python -m py_compile app.py fine_tune.py demo.py monitor.py explain.py`.
-   - Never commit raw dataset folders or private facial crops (`dataset/` is git-ignored).
+   - Never commit raw dataset folders, private facial crops, or fine-tuned/backup weights (`dataset/` and `model/*_backup|_finetuned|_original.keras` are git-ignored).
+   - Keep exactly one OpenCV distribution in `requirements.txt` (`opencv-contrib-python`, which mediapipe requires); CI checks this.

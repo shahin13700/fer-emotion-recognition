@@ -1,10 +1,15 @@
 """
-EdgeVision Active Learning: Fine-Tuning Engine with Production Guardrails
-Enforces 4 strict guardrails:
+EdgeVision Active Learning: Fine-Tuning Engine with Guardrails
+Enforces 4 guardrails:
 1. Minimum Volume Gate (>= 10 samples per emotion class before training)
-2. Oversampled Blended Data Generator (actually mixes user data into every gradient step)
-3. Heavy Augmentation Pipeline (rotation, flip, zoom, brightness)
-4. Empirical Before/After Test Evaluation with Immutable Baseline Rollback
+2. Blended Data Generator (mixes a fixed share of user data into every batch)
+3. Augmentation Pipeline (rotation, flip, zoom, brightness) applied to raw 0-255 pixels
+4. Before/After evaluation on BOTH a held-out slice of the user's own faces and the
+   FER2013 test set; promotion requires no user-holdout regression and a bounded
+   FER2013 regression. The previous production weights are always backed up.
+
+Requires the FER2013 dataset unpacked at dataset/train and dataset/test
+(see README "Retraining Base Model from Scratch" for the download command).
 """
 
 import os
@@ -40,7 +45,20 @@ REPORT_PATH = 'outputs/fine_tune_report.json'
 INDICES_PATH = 'outputs/class_indices.json'
 
 MIN_SAMPLES_PER_CLASS = 10
-USER_OVERSAMPLE_FACTOR = 15
+USER_HOLDOUT_FRACTION = 0.2   # Share of user faces held out to measure personal adaptation
+MAX_TEST_DROP_DEFAULT = 0.01  # Allowed FER2013 test accuracy regression (1.0 percentage point)
+
+
+def check_dataset_dirs():
+    """Fails fast with a useful message if the FER2013 base dataset is missing."""
+    missing = [d for d in (BASE_TRAIN_DIR, TEST_DIR) if not os.path.isdir(d)]
+    if missing:
+        print("[ERROR] Fine-tuning blends your faces with the FER2013 base data, which is not in the repo.")
+        print(f"        Missing: {', '.join(missing)}")
+        print("        Download and unpack it first:")
+        print("          kaggle datasets download -d msambare/fer2013")
+        print("          unzip -q fer2013.zip -d dataset/")
+        sys.exit(1)
 
 
 def ensure_original_baseline():
@@ -127,8 +145,14 @@ def evaluate_model_on_test(model_instance, class_labels):
 
 def load_and_preprocess_user_data(class_indices):
     """
-    Loads user-contributed images as (48, 48, 1) normalized tensors
-    along with one-hot labels.
+    Loads user-contributed images as (48, 48, 1) float32 tensors in the RAW 0-255
+    range (NOT normalized) along with one-hot labels.
+
+    Keeping raw pixel values matters: Keras' legacy ImageDataGenerator applies
+    brightness_range via PIL and truncates any array whose max is <= 1.0 to
+    0/1 integers, turning pre-normalized images into black squares. Rescaling
+    is therefore applied by the generator (rescale=1./255), exactly like the
+    base FER2013 pipeline.
     """
     x_user = []
     y_user = []
@@ -146,7 +170,7 @@ def load_and_preprocess_user_data(class_indices):
                     img = tf.keras.preprocessing.image.load_img(
                         fpath, color_mode='grayscale', target_size=(48, 48)
                     )
-                    arr = tf.keras.preprocessing.image.img_to_array(img) / 255.0
+                    arr = tf.keras.preprocessing.image.img_to_array(img)  # 0-255, rescaled by the generator
                     one_hot = np.zeros(num_classes, dtype=np.float32)
                     one_hot[class_idx] = 1.0
 
@@ -159,27 +183,59 @@ def load_and_preprocess_user_data(class_indices):
     return np.array(x_user, dtype=np.float32), np.array(y_user, dtype=np.float32)
 
 
+def build_user_datagen():
+    """Augmentation for raw 0-255 user faces. rescale runs AFTER the PIL-based brightness shift."""
+    return ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=15,
+        zoom_range=0.15,
+        width_shift_range=0.10,
+        height_shift_range=0.10,
+        brightness_range=[0.85, 1.15],
+        horizontal_flip=True
+    )
+
+
+def split_user_holdout(x_user, y_user, fraction=USER_HOLDOUT_FRACTION, seed=42):
+    """
+    Splits user data into train/holdout per class so the holdout measures whether
+    fine-tuning actually improved recognition of THIS user's faces.
+    Classes with fewer than 5 samples contribute nothing to the holdout.
+    """
+    rng = np.random.default_rng(seed)
+    train_idx, hold_idx = [], []
+    labels = np.argmax(y_user, axis=1) if len(y_user) else np.array([], dtype=int)
+    for cls in np.unique(labels):
+        idx = np.where(labels == cls)[0]
+        rng.shuffle(idx)
+        n_hold = int(len(idx) * fraction) if len(idx) >= 5 else 0
+        hold_idx.extend(idx[:n_hold])
+        train_idx.extend(idx[n_hold:])
+    train_idx, hold_idx = np.array(train_idx, dtype=int), np.array(hold_idx, dtype=int)
+    return x_user[train_idx], y_user[train_idx], x_user[hold_idx], y_user[hold_idx]
+
+
+def evaluate_on_user_holdout(model_instance, x_hold, y_hold):
+    """Accuracy on the raw 0-255 user holdout (normalized here, no augmentation)."""
+    if len(x_hold) == 0:
+        return None
+    preds = model_instance.predict(x_hold / 255.0, verbose=0)
+    return float(accuracy_score(np.argmax(y_hold, axis=1), np.argmax(preds, axis=1)))
+
+
 def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_size=32, user_ratio=0.25):
     """
-    Guardrail 2: Blended Generator that actively injects augmented user data
-    into every training batch alongside base FER2013 samples.
-    
-    NOTE: x_user is already normalized to [0, 1] by load_and_preprocess_user_data.
-    We use user_datagen WITHOUT rescale so user images are NOT divided by 255 twice.
+    Guardrail 2: Blended Generator that injects augmented user data into every
+    training batch alongside base FER2013 samples.
+
+    x_user must be RAW 0-255 pixels (see load_and_preprocess_user_data); the user
+    datagen rescales to [0, 1] after augmentation, matching the base pipeline.
     """
     if len(x_user) == 0:
         return base_gen
 
     if user_datagen is None:
-        user_datagen = ImageDataGenerator(
-            rotation_range=15,
-            zoom_range=0.15,
-            width_shift_range=0.10,
-            height_shift_range=0.10,
-            brightness_range=[0.85, 1.15],
-            horizontal_flip=True
-            # No rescale! x_user is already in [0, 1]
-        )
+        user_datagen = build_user_datagen()
 
     user_batch_size = max(1, int(batch_size * user_ratio))
     base_batch_size = max(1, batch_size - user_batch_size)
@@ -218,6 +274,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=15, help="Number of fine-tuning epochs (default: 15)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for fine-tuning (default: 5e-5)")
+    parser.add_argument("--max_test_drop", type=float, default=MAX_TEST_DROP_DEFAULT,
+                        help="Max allowed FER2013 test accuracy drop before rollback, as a fraction (default: 0.01)")
     args = parser.parse_args()
 
     ensure_original_baseline()
@@ -237,6 +295,7 @@ def main():
     passed, counts = check_guardrails(force=args.force)
     if not passed:
         sys.exit(1)
+    check_dataset_dirs()
 
     with open(INDICES_PATH, 'r') as f:
         class_indices = json.load(f)
@@ -246,26 +305,22 @@ def main():
     baseline_model = load_model(MODEL_PATH)
 
     # -------------------------------------------------------------
-    # Guardrail 4a: Evaluate Baseline Accuracy Before Training
-    # -------------------------------------------------------------
-    print("\nEvaluating Baseline Model on Test Set (`dataset/test`)...")
-    base_acc, _, _ = evaluate_model_on_test(baseline_model, class_labels)
-    print(f"[METRIC] Baseline Test Accuracy: {base_acc*100:.2f}%")
-
-    # -------------------------------------------------------------
-    # Guardrail 2: Oversample & Prepare User Data
+    # Guardrail 2: Load user data and hold out a slice for evaluation
     # -------------------------------------------------------------
     x_user, y_user = load_and_preprocess_user_data(class_indices)
     print(f"\nUser Data Loaded: {len(x_user)} verified portraits.")
+    x_user_train, y_user_train, x_user_hold, y_user_hold = split_user_holdout(x_user, y_user)
+    print(f"User split: {len(x_user_train)} for training, {len(x_user_hold)} held out for evaluation.")
 
-    if len(x_user) > 0:
-        print(f"Applying Guardrail 2: {USER_OVERSAMPLE_FACTOR}x Oversampling on user data...")
-        x_user_oversampled = np.repeat(x_user, USER_OVERSAMPLE_FACTOR, axis=0)
-        y_user_oversampled = np.repeat(y_user, USER_OVERSAMPLE_FACTOR, axis=0)
-        print(f"Effective User Training Volume: {len(x_user_oversampled)} samples.")
-    else:
-        x_user_oversampled = np.empty((0, 48, 48, 1))
-        y_user_oversampled = np.empty((0, len(class_indices)))
+    # -------------------------------------------------------------
+    # Guardrail 4a: Evaluate Baseline Before Training
+    # -------------------------------------------------------------
+    print("\nEvaluating Baseline Model on Test Set (`dataset/test`)...")
+    base_acc, _, _ = evaluate_model_on_test(baseline_model, class_labels)
+    print(f"[METRIC] Baseline FER2013 Test Accuracy: {base_acc*100:.2f}%")
+    base_user_acc = evaluate_on_user_holdout(baseline_model, x_user_hold, y_user_hold)
+    if base_user_acc is not None:
+        print(f"[METRIC] Baseline Accuracy on YOUR held-out faces: {base_user_acc*100:.2f}%")
 
     # -------------------------------------------------------------
     # Guardrail 3: Heavy Data Augmentation Pipeline
@@ -310,12 +365,12 @@ def main():
     )
 
     # Actively blend user-contributed images with base images
-    if len(x_user_oversampled) > 0:
+    if len(x_user_train) > 0:
         print("Blending user data into active training pipeline (25% user / 75% base per batch)...")
         train_pipeline = create_blended_generator(
             base_train_gen,
-            x_user_oversampled,
-            y_user_oversampled,
+            x_user_train,
+            y_user_train,
             user_datagen=None,
             batch_size=args.batch_size,
             user_ratio=0.25
@@ -354,26 +409,41 @@ def main():
     )
 
     # -------------------------------------------------------------
-    # Guardrail 4b: Evaluate Fine-Tuned Accuracy on Test Set
+    # Guardrail 4b: Evaluate Fine-Tuned Model
     # -------------------------------------------------------------
     print("\nEvaluating Fine-Tuned Model on Test Set (`dataset/test`)...")
     new_acc, y_true, y_pred = evaluate_model_on_test(baseline_model, class_labels)
     delta = new_acc - base_acc
+    new_user_acc = evaluate_on_user_holdout(baseline_model, x_user_hold, y_user_hold)
 
     print("\n" + "=" * 60)
     print("FINE-TUNING EVALUATION SUMMARY & SAFETY VERIFICATION")
     print("=" * 60)
-    print(f"Baseline Test Accuracy:   {base_acc*100:.2f}%")
-    print(f"Fine-Tuned Test Accuracy: {new_acc*100:.2f}%")
-    print(f"Accuracy Delta:           {'+' if delta >= 0 else ''}{delta*100:.2f}%")
+    print(f"FER2013 Test Accuracy:   {base_acc*100:.2f}% -> {new_acc*100:.2f}%  ({'+' if delta >= 0 else ''}{delta*100:.2f} pp)")
+    if base_user_acc is not None:
+        user_delta = new_user_acc - base_user_acc
+        print(f"Your Held-Out Faces:     {base_user_acc*100:.2f}% -> {new_user_acc*100:.2f}%  ({'+' if user_delta >= 0 else ''}{user_delta*100:.2f} pp)")
+    else:
+        user_delta = None
+        print("Your Held-Out Faces:     (not enough samples per class for a holdout; skipped)")
+
+    # Promotion rules: the model must not get worse on your own faces, and may lose at most
+    # --max_test_drop on FER2013 (the test set is a regression guard here, not a selection set).
+    test_ok = delta >= -args.max_test_drop
+    user_ok = (user_delta is None) or (user_delta >= 0)
+    promote = test_ok and user_ok
 
     report_data = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "baseline_accuracy": base_acc,
         "finetuned_accuracy": new_acc,
         "accuracy_delta": delta,
+        "baseline_user_holdout_accuracy": base_user_acc,
+        "finetuned_user_holdout_accuracy": new_user_acc,
+        "user_holdout_size": int(len(x_user_hold)),
+        "max_test_drop": args.max_test_drop,
+        "promoted": promote,
         "user_samples_count": counts,
-        "oversample_factor": USER_OVERSAMPLE_FACTOR,
         "epochs": args.epochs,
         "learning_rate": args.lr
     }
@@ -385,14 +455,19 @@ def main():
     baseline_model.save(FINETUNED_MODEL_PATH)
     print(f"Candidate model weights saved to: {FINETUNED_MODEL_PATH}")
 
-    if delta >= 0:
-        print("\n[SUCCESS] Model maintained/improved test accuracy! Promoting weights...")
+    if promote:
+        print("\n[SUCCESS] Candidate passed both guards. Promoting weights...")
         shutil.copyfile(MODEL_PATH, BACKUP_MODEL_PATH)
         baseline_model.save(MODEL_PATH)
         print(f"Previous production weights backed up to: {BACKUP_MODEL_PATH}")
         print(f"New production weights promoted to: {MODEL_PATH}")
     else:
-        print(f"\n[ROLLBACK SAFETY] Accuracy dropped by {abs(delta)*100:.2f}%.")
+        reasons = []
+        if not test_ok:
+            reasons.append(f"FER2013 accuracy dropped {abs(delta)*100:.2f} pp (limit {args.max_test_drop*100:.2f} pp)")
+        if not user_ok:
+            reasons.append(f"accuracy on your held-out faces dropped {abs(user_delta)*100:.2f} pp")
+        print(f"\n[ROLLBACK SAFETY] Not promoted: {'; '.join(reasons)}.")
         print(f"Production weights in {MODEL_PATH} remain UNTOUCHED.")
         print(f"Fine-tuned candidate is preserved in {FINETUNED_MODEL_PATH} for inspection.")
         print(f"Note: You can restore pristine baseline anytime via: python fine_tune.py --reset")

@@ -1,3 +1,11 @@
+"""
+Base model training for EdgeVision (MiniXception on FER2013).
+
+This mirrors notebooks/exploration_and_training.ipynb, which produced the shipped
+model/emotion_model.keras (L2(0.01) on the two stem Conv2D layers and the Dense
+classifier, class-balanced weights, checkpoint on val_accuracy, early stopping on val_loss). Run it to reproduce
+a comparable model; results vary run to run because no seed is fixed.
+"""
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -9,6 +17,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv2D, SeparableConv2D, BatchNormalization, Activation, MaxPooling2D, GlobalAveragePooling2D, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
 from sklearn.utils.class_weight import compute_class_weight
 
 # ---------------------------------------------------------
@@ -24,18 +33,21 @@ def setup_dirs():
 # ---------------------------------------------------------
 # 2. Build the MiniXception Architecture
 # ---------------------------------------------------------
-def build_minixception(input_shape=(48, 48, 1), num_classes=7):
+def build_minixception(input_shape=(48, 48, 1), num_classes=7, l2_weight=0.01):
     """
-    Builds the MiniXception lightweight CNN architecture.
+    Builds the MiniXception lightweight CNN architecture (~51k parameters).
     Uses depthwise separable convolutions to reduce parameters and combat overfitting.
+    L2 regularization is applied where the shipped weights have it: the two stem Conv2D
+    layers and the Dense classifier (Keras 3 SeparableConv2D has no kernel_regularizer).
     """
+    reg = l2(l2_weight)
     img_input = Input(shape=input_shape)
-    
+
     # Base convolution block
-    x = Conv2D(8, (3, 3), strides=(1, 1), padding='same', use_bias=False)(img_input)
+    x = Conv2D(8, (3, 3), strides=(1, 1), padding='same', use_bias=False, kernel_regularizer=reg)(img_input)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
-    x = Conv2D(8, (3, 3), strides=(1, 1), padding='same', use_bias=False)(x)
+    x = Conv2D(8, (3, 3), strides=(1, 1), padding='same', use_bias=False, kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
 
@@ -50,7 +62,7 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     x = Activation('relu')(x)
     x = SeparableConv2D(16, (3, 3), padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
-    
+
     x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
     x = tf.keras.layers.add([x, residual])
 
@@ -65,7 +77,7 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     x = Activation('relu')(x)
     x = SeparableConv2D(32, (3, 3), padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
-    
+
     x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
     x = tf.keras.layers.add([x, residual])
 
@@ -80,7 +92,7 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     x = Activation('relu')(x)
     x = SeparableConv2D(64, (3, 3), padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
-    
+
     x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
     x = tf.keras.layers.add([x, residual])
 
@@ -95,7 +107,7 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     x = Activation('relu')(x)
     x = SeparableConv2D(128, (3, 3), padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
-    
+
     x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
     x = tf.keras.layers.add([x, residual])
 
@@ -104,7 +116,7 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     # ---------------------------------------------------------
     x = GlobalAveragePooling2D()(x)
     x = Dropout(0.5)(x)
-    output = Dense(num_classes, activation='softmax')(x)
+    output = Dense(num_classes, activation='softmax', kernel_regularizer=reg)(x)
 
     model = Model(img_input, output)
     return model
@@ -185,7 +197,7 @@ def main():
         ),
         ModelCheckpoint(
             filepath='model/emotion_model.keras',
-            monitor='val_loss',
+            monitor='val_accuracy',
             save_best_only=True,
             verbose=1
         ),

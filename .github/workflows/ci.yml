@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TF_ENABLE_ONEDNN_OPTS: '0'
+      TF_CPP_MIN_LOG_LEVEL: '2'
       MPLBACKEND: 'Agg'
       PYTHONUNBUFFERED: '1'
 
@@ -24,19 +25,32 @@ jobs:
         python-version: '3.11'
         cache: 'pip'
 
+    - name: Install System Packages (GUI OpenCV build, same as Hugging Face Spaces packages.txt)
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq $(cat packages.txt)
+
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        pip check
+
+    - name: Exactly one OpenCV distribution installed
+      run: |
+        pip list --format=freeze | grep -i '^opencv' || true
+        test "$(pip list --format=freeze | grep -ci '^opencv')" = "1"
 
     - name: Syntax & Code Compilation
       run: |
-        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py
+        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py scripts/calc_percentiles.py
 
     - name: Run Pytest Test Suite
       run: |
         pytest tests/ -v
 
+    - name: Tests must not modify tracked files
+      run: |
+        git status --porcelain
+        test -z "$(git status --porcelain)"
 
     - name: Smoke Test Model & Class Mappings
       run: |
@@ -44,17 +58,13 @@ jobs:
         import json, os, numpy as np, tensorflow as tf
         from tensorflow.keras.models import load_model
 
-        # 1. Verify label mapping
-        assert os.path.exists('outputs/class_indices.json'), 'class_indices.json missing'
         with open('outputs/class_indices.json') as f:
             indices = json.load(f)
         assert len(indices) == 7, f'Expected 7 classes, got {len(indices)}'
 
-        # 2. Verify model loads and predicts correctly
-        assert os.path.exists('model/emotion_model.keras'), 'Model file missing'
         model = load_model('model/emotion_model.keras')
-        dummy_input = tf.zeros((1, 48, 48, 1))
-        preds = model(dummy_input, training=False).numpy()[0]
+        assert model.count_params() == 51255, f'Unexpected parameter count {model.count_params()}'
+        preds = model(tf.zeros((1, 48, 48, 1)), training=False).numpy()[0]
         assert len(preds) == 7, f'Expected 7 output probabilities, got {len(preds)}'
         assert abs(np.sum(preds) - 1.0) < 1e-3, 'Probabilities do not sum to 1.0'
         print('[PASS] Model smoke test passed!')
@@ -65,18 +75,26 @@ jobs:
         python -c "
         import os, cv2, app, numpy as np
 
-        # 1. Blank image has no faces, should safely return empty confidences dict
-        dummy_img = np.zeros((200, 200, 3), dtype=np.uint8)
-        annotated, confs = app.predict_emotion(dummy_img)
+        # Blank image has no faces: empty confidences
+        annotated, confs = app.predict_emotion(np.zeros((200, 200, 3), dtype=np.uint8))
         assert len(confs) == 0, f'Expected 0 confidences on blank image, got {len(confs)}'
 
-        # 2. Benchmark sample face should run through prediction pipeline and return 7 class confidences
-        sample_path = 'assets/samples/happy.jpg'
-        if os.path.exists(sample_path):
-            sample_img = cv2.imread(sample_path)
-            _, sample_confs = app.predict_emotion(sample_img)
-            assert len(sample_confs) == 7, f'Expected 7 confidences on benchmark sample, got {len(sample_confs)}'
+        # 48x48 benchmark crop goes through the tiny-image fallback and yields 7 confidences
+        sample_img = cv2.imread('assets/samples/happy.jpg')
+        _, sample_confs = app.predict_emotion(sample_img)
+        assert len(sample_confs) == 7, f'Expected 7 confidences on benchmark sample, got {len(sample_confs)}'
 
+        # A larger image with no face must NOT be classified
+        _, confs, status = app.process_image(np.random.default_rng(0).integers(0, 255, (300, 300, 3), dtype=np.uint8))
+        assert confs == {}, 'Non-face image was classified'
+
+        # Face saving must be off when SPACE_ID is set (simulated shared deployment)
+        assert app.ALLOW_LOCAL_SAVE is True, 'Local run should allow saving'
         print('[PASS] Gradio inference pipeline passed!')
         "
 
+    - name: Saving is disabled on shared deployments
+      env:
+        SPACE_ID: 'ci/simulated-space'
+      run: |
+        python -c "import app; assert app.ALLOW_LOCAL_SAVE is False; print('[PASS] Spaces privacy guard active')"

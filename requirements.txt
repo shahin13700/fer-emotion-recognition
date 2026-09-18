@@ -1,16 +1,20 @@
 # ─────────────────────────────────────────────────────────────
 # EdgeVision: Facial Emotion Recognition & Fatigue Guard
 # Pinned Dependencies for Reproducibility & Hugging Face Spaces
+# Tested on Python 3.11 (see .github/workflows/ci.yml)
 # ─────────────────────────────────────────────────────────────
 
-# Deep learning core
+# Deep learning core (Keras is pinned too: the shipped .keras file must load identically)
 tensorflow==2.16.2
+keras==3.14.0
 
 # Pinned for TensorFlow 2.16 C-API compatibility
 numpy==1.26.4
 
-# Computer vision
-opencv-python-headless==4.11.0.86
+# Computer vision. ONE OpenCV distribution only: mediapipe depends on opencv-contrib-python,
+# and demo.py / monitor.py need the GUI build (cv2.imshow). Do not add opencv-python or
+# opencv-python-headless alongside it; they overwrite each other's cv2/ package.
+opencv-contrib-python==4.11.0.86
 
 # 3D Facial landmark & Eye Aspect Ratio (EAR) tracking
 mediapipe==1.0.1
@@ -25,4 +29,3 @@ scikit-learn==1.8.0
 
 # Testing & Continuous Integration
 pytest==9.1.1
-

@@ -67,7 +67,7 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index
     grads = tape.gradient(class_channel, conv_output)
     if grads is None:
         grads = tf.ones_like(conv_output)
-    
+
     # Pool gradients across spatial dimensions
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
@@ -91,7 +91,7 @@ def overlay_heatmap(heatmap, original_img, alpha=0.45):
     # Resize heatmap to match image dimensions
     heatmap_resized = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    
+
     if len(original_img.shape) == 2 or original_img.shape[2] == 1:
         original_bgr = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
     else:
@@ -101,19 +101,24 @@ def overlay_heatmap(heatmap, original_img, alpha=0.45):
     return cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB), cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
 
 
-def main():
+def main(output_dir='outputs/gradcam_samples', model_path='model/emotion_model.keras'):
+    """
+    Renders a Grad-CAM gallery. Note the spatial resolution: the target layer's feature map
+    is 3x3 for this architecture, so each heatmap is a coarse 3x3 attribution grid upsampled
+    to 48x48. It shows which region of the face contributed most, not fine detail.
+    """
     print("Initializing Grad-CAM Interpretability Engine...")
-    
-    output_dir = 'outputs/gradcam_samples'
+
     os.makedirs(output_dir, exist_ok=True)
 
     with open('outputs/class_indices.json') as f:
         class_indices = json.load(f)
     idx_to_class = {v: k.capitalize() for k, v in class_indices.items()}
 
-    model = load_model('model/emotion_model.keras')
+    model = load_model(model_path)
     target_layer = find_last_conv_layer(model)
-    print(f"Targeting interpretability feature layer: {target_layer}")
+    fmap_shape = model.get_layer(target_layer).output.shape
+    print(f"Targeting interpretability feature layer: {target_layer} (feature map {fmap_shape[1]}x{fmap_shape[2]})")
 
     test_dir = 'dataset/test'
     samples_dir = 'assets/samples'
@@ -124,13 +129,13 @@ def main():
         for emotion in sorted(os.listdir(test_dir)):
             folder = os.path.join(test_dir, emotion)
             if os.path.isdir(folder):
-                files = [f for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                files = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg')))
                 if files:
                     sample_images[emotion.lower()] = os.path.join(folder, files[0])
 
     # Fallback to packaged assets/samples/ for any missing categories
     if os.path.exists(samples_dir):
-        for fname in os.listdir(samples_dir):
+        for fname in sorted(os.listdir(samples_dir)):
             if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
                 emo_name = os.path.splitext(fname)[0].lower()
                 if emo_name not in sample_images:
@@ -156,12 +161,13 @@ def main():
         elif layer.name == target_layer:
             found = True
 
-    fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)))
+    fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)), squeeze=False)
     plt.subplots_adjust(hspace=0.4, wspace=0.2)
+    n_correct = 0
 
     for i, emotion in enumerate(emotions):
         img_path = sample_images[emotion]
-        
+
         # Read grayscale 48x48
         gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         resized = cv2.resize(gray_img, (48, 48))
@@ -194,17 +200,23 @@ def main():
         axes[i, 1].set_title("Activation Heatmap", fontsize=10)
         axes[i, 1].axis('off')
 
-        # Plot Overlay
+        # Plot Overlay (flag misclassified samples honestly)
+        correct = pred_label.lower() == emotion.lower()
+        n_correct += int(correct)
+        mark = "✓" if correct else "✗"
         axes[i, 2].imshow(overlay)
-        axes[i, 2].set_title(f"Grad-CAM ({pred_label}: {conf:.1f}%)", fontsize=10)
+        axes[i, 2].set_title(f"{mark} Pred: {pred_label} ({conf:.1f}%)", fontsize=10,
+                             color=("black" if correct else "firebrick"))
         axes[i, 2].axis('off')
 
-    plt.suptitle("Explainable AI: MiniXception Grad-CAM Feature Attributions", fontsize=13, y=1.002)
+    plt.suptitle(f"MiniXception Grad-CAM ({fmap_shape[1]}x{fmap_shape[2]} attribution grid) — "
+                 f"{n_correct}/{len(emotions)} samples classified correctly", fontsize=12, y=1.002)
     save_path = os.path.join(output_dir, 'gradcam_gallery.png')
     plt.savefig(save_path, dpi=180, bbox_inches='tight')
     plt.close()
-    
-    print(f"Grad-CAM analysis complete! Visual gallery saved to {save_path}")
+
+    print(f"Grad-CAM analysis complete! {n_correct}/{len(emotions)} samples correct. Gallery saved to {save_path}")
+    return save_path
 
 if __name__ == '__main__':
     main()
