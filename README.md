@@ -116,6 +116,14 @@ pip install -r requirements.txt
   python fine_tune.py --reset
   ```
 
+* **Retraining Base Model from Scratch (Optional):**
+  ```bash
+  # Download and unpack FER2013 if training from scratch
+  kaggle datasets download -d msambare/fer2013
+  unzip -q fer2013.zip -d dataset/
+  python train.py
+  ```
+
 ---
 
 ## 🔮 Roadmap & Future Engineering

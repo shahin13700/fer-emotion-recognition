@@ -13,6 +13,8 @@ import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import app
 import fine_tune
+import explain
+from PIL import Image
 
 
 def test_empirical_thresholds_defined():
@@ -306,3 +308,44 @@ def test_multi_face_temporal_smoothing_isolation(monkeypatch):
     assert abs(new_smoothed[3] - 0.70) < 1e-4
     # Secondary face (angry) did NOT cross-contaminate new_smoothed
     assert new_smoothed[0] == 0.0
+
+
+def test_generate_photo_strip_returns_pil_image():
+    """Verifies generate_photo_strip returns a PIL Image in-memory without disk leaks."""
+    state = app.init_booth_state()
+    state["Happy"]["crop"] = np.full((100, 100, 3), 200, dtype=np.uint8)
+    state["Happy"]["score"] = 0.95
+    strip = app.generate_photo_strip(state)
+    assert isinstance(strip, Image.Image)
+    assert strip.width > 0 and strip.height > 0
+
+
+def test_local_dataset_stats_counts_physical_files(tmp_path, monkeypatch):
+    """Verifies get_local_dataset_stats prioritizes physical files for parity with fine_tune.py."""
+    fake_contrib_dir = str(tmp_path / "user_contributed")
+    os.makedirs(os.path.join(fake_contrib_dir, "happy"), exist_ok=True)
+    os.makedirs(os.path.join(fake_contrib_dir, "surprise"), exist_ok=True)
+
+    # Save 3 dummy images in happy, 2 in surprise
+    for i in range(3):
+        Image.new("RGB", (48, 48)).save(os.path.join(fake_contrib_dir, "happy", f"h_{i}.png"))
+    for i in range(2):
+        Image.new("RGB", (48, 48)).save(os.path.join(fake_contrib_dir, "surprise", f"s_{i}.png"))
+
+    monkeypatch.setattr(app, "USER_CONTRIB_DIR", fake_contrib_dir)
+    total, per_class, banner = app.get_local_dataset_stats()
+
+    assert total == 5
+    assert per_class["Happy"] == 3
+    assert per_class["Surprise"] == 2
+    assert "5 Verified Faces Saved Locally" in banner
+
+
+def test_explain_samples_fallback():
+    """Verifies explain.py executes successfully using assets/samples/."""
+    # Ensure assets/samples contains sample images
+    assert os.path.exists("assets/samples")
+    assert len(os.listdir("assets/samples")) >= 7
+    # Verify main runs without error
+    explain.main()
+    assert os.path.exists(os.path.join("outputs", "gradcam_samples", "gradcam_gallery.png"))

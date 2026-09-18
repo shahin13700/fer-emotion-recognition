@@ -86,25 +86,44 @@ def init_booth_state():
 
 
 def get_local_dataset_stats():
-    """Reads metadata.jsonl and returns current count, per-class counts, and local active learning status."""
-    total_count = 0
+    """
+    Returns current count, per-class counts, and local active learning status banner.
+    Prefers physical files in dataset/user_contributed/<emotion>/ for 100% parity with fine_tune.py,
+    falling back to metadata.jsonl if directory folders are not yet populated.
+    """
     per_class = {e: 0 for e in emotion_labels}
-    if os.path.exists(METADATA_JSONL):
-        try:
-            with open(METADATA_JSONL, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            record = json.loads(line)
-                            total_count += 1
-                            emo = record.get("emotion", "").capitalize()
-                            if emo in per_class:
-                                per_class[emo] += 1
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+    has_physical_dirs = False
+
+    if os.path.exists(USER_CONTRIB_DIR):
+        for emotion in emotion_labels:
+            emo_folder = os.path.join(USER_CONTRIB_DIR, emotion.lower())
+            if os.path.isdir(emo_folder):
+                valid_files = [f for f in os.listdir(emo_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                if len(valid_files) > 0:
+                    has_physical_dirs = True
+                per_class[emotion] = len(valid_files)
+
+    if has_physical_dirs:
+        total_count = sum(per_class.values())
+    else:
+        # Fall back to metadata.jsonl for mock/test environments or unindexed setups
+        total_count = 0
+        if os.path.exists(METADATA_JSONL):
+            try:
+                with open(METADATA_JSONL, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                record = json.loads(line)
+                                total_count += 1
+                                emo = record.get("emotion", "").capitalize()
+                                if emo in per_class:
+                                    per_class[emo] += 1
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
     ready_classes = sum(1 for cnt in per_class.values() if cnt >= 10)
     status_md = (
@@ -434,10 +453,7 @@ def generate_photo_strip(booth_state):
     draw.text((stx + 20, sty + 170), "MiniXception 817 KB", fill=(150, 150, 150))
     draw.text((stx + 20, sty + 195), "60+ FPS Real-Time Edge", fill=(100, 100, 100))
 
-    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    temp_out.close()
-    canvas.save(temp_out.name, "PNG")
-    return temp_out.name
+    return canvas
 
 
 def reset_booth():

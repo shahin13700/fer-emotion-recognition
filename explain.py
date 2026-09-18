@@ -91,21 +91,43 @@ def main():
     idx_to_class = {v: k.capitalize() for k, v in class_indices.items()}
 
     model = load_model('model/emotion_model.keras')
+    target_layer = find_last_conv_layer(model)
+    print(f"Targeting interpretability feature layer: {target_layer}")
+
     test_dir = 'dataset/test'
-    
-    emotions = sorted(os.listdir(test_dir))
+    samples_dir = 'assets/samples'
+
+    # Support out-of-the-box execution on clean clones without full dataset
+    sample_images = {}
+    if os.path.exists(test_dir):
+        for emotion in sorted(os.listdir(test_dir)):
+            folder = os.path.join(test_dir, emotion)
+            if os.path.isdir(folder):
+                files = [f for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                if files:
+                    sample_images[emotion.lower()] = os.path.join(folder, files[0])
+
+    # Fallback to packaged assets/samples/ for any missing categories
+    if os.path.exists(samples_dir):
+        for fname in os.listdir(samples_dir):
+            if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                emo_name = os.path.splitext(fname)[0].lower()
+                if emo_name not in sample_images:
+                    sample_images[emo_name] = os.path.join(samples_dir, fname)
+
+    if not sample_images:
+        raise FileNotFoundError(
+            "No test images found! Neither 'dataset/test' nor 'assets/samples/' contains valid images."
+        )
+
+    emotions = sorted(sample_images.keys())
     print(f"Generating Grad-CAM explanations for {len(emotions)} emotion categories...")
 
     fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)))
     plt.subplots_adjust(hspace=0.4, wspace=0.2)
 
     for i, emotion in enumerate(emotions):
-        folder = os.path.join(test_dir, emotion)
-        if not os.path.isdir(folder):
-            continue
-            
-        sample_img_name = os.listdir(folder)[0]
-        img_path = os.path.join(folder, sample_img_name)
+        img_path = sample_images[emotion]
         
         # Read grayscale 48x48
         gray_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
@@ -116,11 +138,11 @@ def main():
         # Predict
         preds = model(inp_tensor, training=False).numpy()[0]
         top_idx = int(np.argmax(preds))
-        pred_label = idx_to_class[top_idx]
+        pred_label = idx_to_class.get(top_idx, f"Class {top_idx}")
         conf = preds[top_idx] * 100
 
         # Compute Grad-CAM
-        heatmap = make_gradcam_heatmap(inp_tensor, model, last_conv_layer_name="add_7", pred_index=top_idx)
+        heatmap = make_gradcam_heatmap(inp_tensor, model, last_conv_layer_name=target_layer, pred_index=top_idx)
         overlay, colored_hm = overlay_heatmap(heatmap, resized)
 
         # Plot Original
