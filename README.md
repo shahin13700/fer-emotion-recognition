@@ -148,6 +148,12 @@ Practical next steps for edge deployment:
 ├── CONTRIBUTING.md                # Development setup & contribution guide
 ├── assets/
 │   └── samples/                   # High-quality benchmark sample faces for UI fallbacks
+├── docs/
+│   └── academic_research_report.md # Comprehensive theoretical analysis & literature review
+├── notebooks/
+│   └── exploration_and_training.ipynb # Interactive exploration and training experiments
+├── scripts/
+│   └── calc_percentiles.py        # Utility for computing empirical percentile cutoffs
 ├── model/
 │   ├── emotion_model.keras        # Active trained model weights (817 KB)
 │   └── emotion_model_original.keras # Immutable ground truth baseline
@@ -157,7 +163,7 @@ Practical next steps for edge deployment:
 │   └── gradcam_samples/           # Generated Grad-CAM visualization galleries
 ├── tests/
 │   ├── __init__.py                # Test package initialization
-│   └── test_active_learning.py    # Automated test suite
+│   └── test_active_learning.py    # Automated test suite (16 tests)
 ├── requirements.txt               # Pinned Python package dependencies
 ├── LICENSE                        # MIT License
 └── README.md
