@@ -66,12 +66,12 @@ jobs:
         annotated, confs = app.predict_emotion(dummy_img)
         assert len(confs) == 0, f'Expected 0 confidences on blank image, got {len(confs)}'
 
-        # 2. Benchmark sample face should run through prediction pipeline
+        # 2. Benchmark sample face should run through prediction pipeline and return 7 class confidences
         sample_path = 'assets/samples/happy.jpg'
         if os.path.exists(sample_path):
             sample_img = cv2.imread(sample_path)
             _, sample_confs = app.predict_emotion(sample_img)
-            assert len(sample_confs) in (0, 7), f'Expected 0 or 7 confidences, got {len(sample_confs)}'
+            assert len(sample_confs) == 7, f'Expected 7 confidences on benchmark sample, got {len(sample_confs)}'
 
         print('[PASS] Gradio inference pipeline passed!')
         "

@@ -84,8 +84,11 @@ def main():
         if len(faces) == 0:
             smoothed_preds = None  # Reset smoother when face leaves frame
 
+        # Sort detected faces by area descending so primary face is index 0
+        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+
         # Process every detected face
-        for (x, y, w, h) in faces:
+        for idx, (x, y, w, h) in enumerate(faces):
             # Draw primary face rectangle
             cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 191, 0), 2)  # Deep blue box
             
@@ -105,13 +108,16 @@ def main():
             preds = model(tensor_input, training=False)
             raw_preds = preds.numpy()[0]
             
-            # Apply Exponential Moving Average (EMA) temporal smoothing
-            if smoothed_preds is None:
-                smoothed_preds = raw_preds
+            # Apply Exponential Moving Average (EMA) temporal smoothing ONLY to primary face
+            if idx == 0:
+                if smoothed_preds is None:
+                    smoothed_preds = raw_preds
+                else:
+                    smoothed_preds = alpha * raw_preds + (1.0 - alpha) * smoothed_preds
+                preds_display = smoothed_preds
             else:
-                smoothed_preds = alpha * raw_preds + (1.0 - alpha) * smoothed_preds
-            
-            preds_display = smoothed_preds
+                preds_display = raw_preds
+
             max_idx = int(np.argmax(preds_display))
             max_conf = preds_display[max_idx]
             top_emotion = emotion_labels[max_idx]

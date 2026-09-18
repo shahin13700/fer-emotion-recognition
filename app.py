@@ -123,8 +123,10 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
     """
     Detects faces on a single BGR frame, draws clean bounding box +
     top emotion label above the forehead, and returns confidences dict.
+    Preserves input frame_bgr without in-place drawing mutation.
     """
     h, w, _ = frame_bgr.shape
+    annotated = frame_bgr.copy()
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
     scale_factor = 2 if max(h, w) > 480 else 1
@@ -145,13 +147,15 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
 
     confidences = {}
     if len(faces) == 0:
-        return frame_bgr, confidences, None, []
+        return annotated, confidences, None, []
 
+    # Sort detected faces by area descending so primary face is index 0
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     detected_faces_info = []
 
-    for (x, y, fw, fh) in faces:
+    for idx, (x, y, fw, fh) in enumerate(faces):
         box_color = (0, 230, 255) # High-visibility Cyan
-        cv2.rectangle(frame_bgr, (x, y), (x + fw, y + fh), box_color, 3)
+        cv2.rectangle(annotated, (x, y), (x + fw, y + fh), box_color, 3)
 
         roi_gray = gray[y:y+fh, x:x+fw]
         roi_gray = cv2.resize(roi_gray, (48, 48), interpolation=cv2.INTER_AREA)
@@ -160,16 +164,20 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
 
         raw_preds = model(tf.convert_to_tensor(roi), training=False).numpy()[0]
 
-        if smoothed_preds is None:
-            smoothed_preds = raw_preds
+        # Apply EMA smoothing ONLY to primary face (idx == 0) to avoid multi-person cross-talk
+        if idx == 0:
+            if smoothed_preds is None:
+                smoothed_preds = raw_preds
+            else:
+                smoothed_preds = alpha * raw_preds + (1.0 - alpha) * smoothed_preds
+            face_preds = smoothed_preds
+            confidences = {emotion_labels[i]: float(face_preds[i]) for i in range(len(emotion_labels))}
         else:
-            smoothed_preds = alpha * raw_preds + (1.0 - alpha) * smoothed_preds
+            face_preds = raw_preds
 
-        confidences = {emotion_labels[i]: float(smoothed_preds[i]) for i in range(len(emotion_labels))}
-
-        top_idx = int(np.argmax(smoothed_preds))
+        top_idx = int(np.argmax(face_preds))
         top_label = emotion_labels[top_idx]
-        top_conf = smoothed_preds[top_idx]
+        top_conf = face_preds[top_idx]
 
         # Clean, bold badge above forehead
         font_scale = max(0.85, fw / 180.0)
@@ -180,8 +188,8 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         
         badge_top = max(0, y - text_h - 16)
         badge_bottom = y
-        cv2.rectangle(frame_bgr, (x, badge_top), (x + text_w + 18, badge_bottom), box_color, -1)
-        cv2.putText(frame_bgr, label_text, (x + 8, badge_bottom - 7),
+        cv2.rectangle(annotated, (x, badge_top), (x + text_w + 18, badge_bottom), box_color, -1)
+        cv2.putText(annotated, label_text, (x + 8, badge_bottom - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thick, cv2.LINE_AA)
 
         detected_faces_info.append({
@@ -190,7 +198,7 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
             "score": top_conf
         })
 
-    return frame_bgr, confidences, smoothed_preds, detected_faces_info
+    return annotated, confidences, smoothed_preds, detected_faces_info
 
 
 # -------------------------------------------------------------
@@ -214,6 +222,7 @@ def process_booth_frame(frame, booth_state):
         frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    clean_bgr = frame_bgr.copy()
     annotated_bgr, confs, _, face_infos = annotate_frame(frame_bgr)
 
     new_capture = False
@@ -229,10 +238,10 @@ def process_booth_frame(frame, booth_state):
             pad_y = int(fh * 0.25)
             x1 = max(0, x - pad_x)
             y1 = max(0, y - pad_y)
-            x2 = min(frame_bgr.shape[1], x + fw + pad_x)
-            y2 = min(frame_bgr.shape[0], y + fh + pad_y)
+            x2 = min(clean_bgr.shape[1], x + fw + pad_x)
+            y2 = min(clean_bgr.shape[0], y + fh + pad_y)
             
-            crop_bgr = frame_bgr[y1:y2, x1:x2]
+            crop_bgr = clean_bgr[y1:y2, x1:x2]
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             
             booth_state[label] = {
@@ -461,7 +470,37 @@ def process_image(input_image):
     if input_image is None:
         return None, {}
     frame_bgr = cv2.cvtColor(input_image, cv2.COLOR_RGB2BGR)
-    annotated_bgr, confs, _, _ = annotate_frame(frame_bgr)
+    annotated_bgr, confs, _, face_infos = annotate_frame(frame_bgr)
+
+    # Fallback for tight headshots / pre-cropped faces (e.g. FER2013 48x48 samples) where Haar finds 0 faces
+    if len(confs) == 0:
+        h, w, _ = frame_bgr.shape
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        aspect_ratio = w / float(h)
+        # Check that image is not blank/flat and has portrait/square avatar aspect ratio
+        if 0.65 <= aspect_ratio <= 1.55 and float(np.std(gray)) > 15.0 and max(h, w) <= 500:
+            roi_gray = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA)
+            roi = roi_gray.astype('float32') / 255.0
+            roi = np.expand_dims(np.expand_dims(roi, axis=0), axis=-1)
+            raw_preds = model(tf.convert_to_tensor(roi), training=False).numpy()[0]
+            confs = {emotion_labels[i]: float(raw_preds[i]) for i in range(len(emotion_labels))}
+
+            top_idx = int(np.argmax(raw_preds))
+            top_label = emotion_labels[top_idx]
+            top_conf = raw_preds[top_idx]
+
+            annotated_bgr = frame_bgr.copy()
+            box_color = (0, 230, 255)
+            cv2.rectangle(annotated_bgr, (0, 0), (w - 1, h - 1), box_color, 2)
+            label_text = f"{top_label.upper()} {top_conf*100:.0f}%"
+            font_scale = max(0.45, w / 160.0)
+            font_thick = 1 if font_scale < 0.6 else 2
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
+            badge_top = max(0, h - th - 8)
+            cv2.rectangle(annotated_bgr, (0, badge_top), (min(w, tw + 10), h), box_color, -1)
+            cv2.putText(annotated_bgr, label_text, (4, h - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thick, cv2.LINE_AA)
+
     return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs
 
 # Backward compatibility alias for test suites and CI smoke tests
@@ -487,8 +526,24 @@ def process_video_file(video_path, progress=gr.Progress()):
         temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         temp_out.close()
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
+        # Try browser-friendly AVC/H.264 codecs first, fallback to mp4v
+        codecs_to_try = ['avc1', 'H264', 'mp4v']
+        out = None
+        for c in codecs_to_try:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*c)
+                w_candidate = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
+                if w_candidate.isOpened():
+                    out = w_candidate
+                    break
+                else:
+                    w_candidate.release()
+            except Exception:
+                continue
+
+        if out is None or not out.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
 
         smoothed_preds = None
         frame_idx = 0

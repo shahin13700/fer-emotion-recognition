@@ -6,8 +6,10 @@ import os
 import json
 import shutil
 import tempfile
+import cv2
 import numpy as np
 import pytest
+import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import app
 import fine_tune
@@ -155,11 +157,19 @@ def test_fine_tune_guardrail_blocking(tmp_path, monkeypatch):
 
 
 def test_ci_backward_compatibility_alias():
-    """Verifies predict_emotion alias exists for existing CI smoke tests."""
+    """Verifies predict_emotion alias exists and returns exact expected confidences."""
     assert hasattr(app, "predict_emotion")
+    # 1. Blank image returns 0 confidences
     dummy_img = np.zeros((120, 120, 3), dtype=np.uint8)
     annotated, confs = app.predict_emotion(dummy_img)
-    assert len(confs) == 7 or len(confs) == 0
+    assert len(confs) == 0, f"Expected 0 confidences on blank image, got {len(confs)}"
+
+    # 2. Benchmark sample crop returns full 7 class probabilities via headshot fallback
+    sample_path = os.path.join("assets", "samples", "happy.jpg")
+    if os.path.exists(sample_path):
+        sample_img = cv2.imread(sample_path)
+        _, sample_confs = app.predict_emotion(sample_img)
+        assert len(sample_confs) == 7, f"Expected 7 confidences, got {len(sample_confs)}"
 
 
 def test_blended_generator_actually_mixes_user_data():
@@ -219,3 +229,80 @@ def test_original_model_preservation():
     fine_tune.ensure_original_baseline()
     assert os.path.exists(fine_tune.ORIGINAL_MODEL_PATH)
     assert os.path.getsize(fine_tune.ORIGINAL_MODEL_PATH) > 800000  # ~817 KB
+
+
+def test_annotate_frame_preserves_input_frame(monkeypatch):
+    """Verifies annotate_frame does not mutate the input frame_bgr in-place."""
+    fake_frame = np.full((120, 120, 3), 128, dtype=np.uint8)
+    original_copy = fake_frame.copy()
+
+    # Mock face_cascade to detect a face so annotations are drawn
+    class DummyCascade:
+        def detectMultiScale(self, *args, **kwargs):
+            return [(20, 20, 60, 60)]
+
+    monkeypatch.setattr(app, "face_cascade", DummyCascade())
+    annotated, confs, _, face_infos = app.annotate_frame(fake_frame)
+
+    # Input frame must remain unmodified
+    assert np.array_equal(fake_frame, original_copy), "annotate_frame modified input frame in-place!"
+    # Annotated frame must have differences (drawn bounding box and badge)
+    assert not np.array_equal(annotated, original_copy), "annotated frame should contain drawings!"
+
+
+def test_booth_crops_are_untainted(monkeypatch):
+    """Verifies that facial crops captured in Photo Booth have no cyan overlay pixels."""
+    test_frame_rgb = np.full((120, 120, 3), 180, dtype=np.uint8)
+
+    class DummyCascade:
+        def detectMultiScale(self, *args, **kwargs):
+            return [(20, 20, 60, 60)]
+
+    monkeypatch.setattr(app, "face_cascade", DummyCascade())
+    booth_state = app.init_booth_state()
+
+    # Mock model to return high confidence for 'happy' so it triggers a crop capture
+    dummy_preds = np.zeros(7, dtype=np.float32)
+    dummy_preds[3] = 0.95  # 'happy'
+    monkeypatch.setattr(app, "model", lambda x, training=False: tf.constant([dummy_preds]))
+
+    annotated, status, gallery, new_state = app.process_booth_frame(test_frame_rgb, booth_state)
+    captured_crop = new_state["Happy"]["crop"]
+    assert captured_crop is not None
+
+    # Cyan color in RGB is (255, 230, 0)
+    cyan_pixels = np.all(captured_crop == [255, 230, 0], axis=-1)
+    assert not np.any(cyan_pixels), "Captured crop contains drawn cyan bounding box pixels!"
+
+
+def test_multi_face_temporal_smoothing_isolation(monkeypatch):
+    """Verifies temporal smoothing is applied only to primary face without cross-talk."""
+    fake_frame = np.full((200, 200, 3), 128, dtype=np.uint8)
+
+    # Two faces: Face 1 (smaller: 40x40), Face 2 (larger: 80x80)
+    class MultiFaceCascade:
+        def detectMultiScale(self, *args, **kwargs):
+            return [(10, 10, 40, 40), (60, 60, 80, 80)]
+
+    monkeypatch.setattr(app, "face_cascade", MultiFaceCascade())
+
+    call_count = [0]
+    def mock_model(tensor_input, training=False):
+        call_count[0] += 1
+        p = np.zeros(7, dtype=np.float32)
+        if call_count[0] % 2 == 1:
+            p[3] = 0.90  # happy for primary (80x80)
+        else:
+            p[0] = 0.85  # angry for secondary (40x40)
+        return tf.constant([p])
+
+    monkeypatch.setattr(app, "model", mock_model)
+
+    prev_smoothed = np.zeros(7, dtype=np.float32)
+    prev_smoothed[3] = 0.50  # initial happy smoothing
+    annotated, confs, new_smoothed, face_infos = app.annotate_frame(fake_frame, smoothed_preds=prev_smoothed, alpha=0.5)
+
+    # Primary face was 80x80, smoothed with alpha=0.5: 0.5 * 0.90 + 0.5 * 0.50 = 0.70
+    assert abs(new_smoothed[3] - 0.70) < 1e-4
+    # Secondary face (angry) did NOT cross-contaminate new_smoothed
+    assert new_smoothed[0] == 0.0

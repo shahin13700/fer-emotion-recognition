@@ -281,6 +281,12 @@ def main():
         validation_split=0.15
     )
 
+    # Separate unaugmented datagen for clean validation metrics without noisy distortions
+    val_datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=0.15
+    )
+
     base_train_gen = train_datagen.flow_from_directory(
         BASE_TRAIN_DIR,
         target_size=(48, 48),
@@ -288,16 +294,18 @@ def main():
         batch_size=args.batch_size,
         class_mode='categorical',
         subset='training',
+        seed=42,
         shuffle=True
     )
 
-    val_gen = train_datagen.flow_from_directory(
+    val_gen = val_datagen.flow_from_directory(
         BASE_TRAIN_DIR,
         target_size=(48, 48),
         color_mode='grayscale',
         batch_size=args.batch_size,
         class_mode='categorical',
         subset='validation',
+        seed=42,
         shuffle=False
     )
 
