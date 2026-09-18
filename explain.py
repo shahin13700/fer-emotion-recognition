@@ -26,38 +26,54 @@ def find_last_conv_layer(model):
     return "add_7"
 
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None, grad_model=None):
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None, conv_model=None, subsequent_layers=None):
     """
     Generates Grad-CAM heatmap for a given input image array and target class.
+    Uses direct 2-stage differentiation for robust, crash-free execution in Keras 3.
     """
-    if grad_model is None:
-        if last_conv_layer_name is None:
-            last_conv_layer_name = find_last_conv_layer(model)
+    if last_conv_layer_name is None:
+        last_conv_layer_name = find_last_conv_layer(model)
 
-        # Create sub-model mapping input -> (last conv output, final output)
-        grad_model = tf.keras.models.Model(
+    if conv_model is None:
+        conv_model = tf.keras.models.Model(
             inputs=model.input,
-            outputs=[model.get_layer(last_conv_layer_name).output, model.output]
+            outputs=model.get_layer(last_conv_layer_name).output
         )
 
+    if subsequent_layers is None:
+        subsequent_layers = []
+        found = False
+        for layer in model.layers:
+            if found:
+                subsequent_layers.append(layer)
+            elif layer.name == last_conv_layer_name:
+                found = True
+
+    # 1. Forward pass through convolutional feature extractor
+    conv_output = conv_model(img_array)
+
+    # 2. Differentiate class activation directly with respect to conv_output
     with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model(img_array)
-        tape.watch(last_conv_layer_output)
+        tape.watch(conv_output)
+        x = conv_output
+        for layer in subsequent_layers:
+            x = layer(x, training=False)
+        preds = x
         if pred_index is None:
             pred_index = tf.argmax(preds[0])
         class_channel = preds[:, pred_index]
 
-    # Gradient of target class with respect to the last feature map
-    grads = tape.gradient(class_channel, last_conv_layer_output)
+    # Gradient of target class with respect to the feature map activations
+    grads = tape.gradient(class_channel, conv_output)
     if grads is None:
-        grads = tf.ones_like(last_conv_layer_output)
+        grads = tf.ones_like(conv_output)
     
-    # Vector where each entry is the mean intensity of gradient over a feature channel
+    # Pool gradients across spatial dimensions
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    # Multiply each channel in feature map by "how important this channel is"
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
+    # Weight each feature map channel by its gradient importance
+    conv_output = conv_output[0]
+    heatmap = conv_output @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
     # ReLU on heatmap to only consider positive influences
@@ -128,10 +144,17 @@ def main():
     emotions = sorted(sample_images.keys())
     print(f"Generating Grad-CAM explanations for {len(emotions)} emotion categories...")
 
-    grad_model = tf.keras.models.Model(
+    conv_model = tf.keras.models.Model(
         inputs=model.input,
-        outputs=[model.get_layer(target_layer).output, model.output]
+        outputs=model.get_layer(target_layer).output
     )
+    subsequent_layers = []
+    found = False
+    for layer in model.layers:
+        if found:
+            subsequent_layers.append(layer)
+        elif layer.name == target_layer:
+            found = True
 
     fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)))
     plt.subplots_adjust(hspace=0.4, wspace=0.2)
@@ -151,8 +174,14 @@ def main():
         pred_label = idx_to_class.get(top_idx, f"Class {top_idx}")
         conf = preds[top_idx] * 100
 
-        # Compute Grad-CAM using pre-instantiated sub-model
-        heatmap = make_gradcam_heatmap(inp_tensor, model, grad_model=grad_model, pred_index=top_idx)
+        # Compute Grad-CAM using direct 2-stage submodel
+        heatmap = make_gradcam_heatmap(
+            inp_tensor,
+            model,
+            conv_model=conv_model,
+            subsequent_layers=subsequent_layers,
+            pred_index=top_idx
+        )
         overlay, colored_hm = overlay_heatmap(heatmap, resized)
 
         # Plot Original

@@ -9,6 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      TF_ENABLE_ONEDNN_OPTS: '0'
+      MPLBACKEND: 'Agg'
+      PYTHONUNBUFFERED: '1'
 
     steps:
     - name: Checkout Repository
