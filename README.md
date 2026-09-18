@@ -29,7 +29,7 @@ Powered by a compact **MiniXception CNN** (~60,000 parameters, 817 KB) trained w
 ## 🌟 Key Features
 
 - ⚡ **Sub-10ms Edge Inference:** MiniXception uses depthwise separable convolutions to reduce parameters by ~8x compared to standard convolutions. Model size is only **817 KB**.
-- 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge that tracks your peak expressions across all 7 emotions using **empirical confidence thresholds** and exports a downloadable **Emotion Photo Strip**.
+- 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge that uses **Dynamic Peak Expression Tracking** (with a responsive 25% noise floor) to capture your personal best facial expressions across all 7 emotions, complete with real-time emerald capture feedback and a downloadable **Emotion Photo Strip**.
 - 💾 **Local Active Learning & Personal Dataset Builder:** Save verified webcam portraits locally to `dataset/user_contributed/metadata.jsonl` to tailor the model to your camera, lighting, and facial traits.
 - 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Blended data generator that combines user data with base training data, enforces a minimum 10 samples/class gate, heavy data augmentation, and test set rollback protection if accuracy drops.
 - 👁️ **Fatigue & Drowsiness Guard:** Real-time **Eye Aspect Ratio (EAR)** calculation via 468 3D facial landmarks detects eye closure and micro-sleeps.
@@ -163,7 +163,7 @@ Practical next steps for edge deployment:
 │   └── gradcam_samples/           # Generated Grad-CAM visualization galleries
 ├── tests/
 │   ├── __init__.py                # Test package initialization
-│   └── test_active_learning.py    # Automated test suite (16 tests)
+│   └── test_active_learning.py    # Automated test suite (17 tests)
 ├── requirements.txt               # Pinned Python package dependencies
 ├── LICENSE                        # MIT License
 └── README.md
