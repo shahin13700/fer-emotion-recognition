@@ -85,8 +85,8 @@ def init_booth_state():
     }
 
 
-def get_community_counter_stats():
-    """Reads metadata.jsonl and returns current count, target, and formatted banner."""
+def get_local_dataset_stats():
+    """Reads metadata.jsonl and returns current count, per-class counts, and local active learning status."""
     total_count = 0
     per_class = {e: 0 for e in emotion_labels}
     if os.path.exists(METADATA_JSONL):
@@ -106,17 +106,17 @@ def get_community_counter_stats():
         except Exception:
             pass
 
-    pct = min(100, int((total_count / COMMUNITY_GOAL) * 100))
-    filled_bars = int(pct / 10)
-    empty_bars = 10 - filled_bars
-    bar_str = "█" * filled_bars + "░" * empty_bars
-
+    ready_classes = sum(1 for cnt in per_class.values() if cnt >= 10)
     status_md = (
-        f"### 🌟 Community Active Learning Engine\n"
-        f"**`{total_count} / {COMMUNITY_GOAL} Community Faces Collected`** `[{bar_str}]` **`{pct}%` toward EdgeVision v2.0 Retraining**\n\n"
-        f"*Contribute your verified expressions from the Photo Booth below to power our next-generation edge model!*"
+        f"### 💾 Local Active Learning: Personal Dataset Builder\n"
+        f"**`{total_count} Verified Faces Saved Locally`** • **`{ready_classes}/7 Classes Ready for Fine-Tuning (≥10 per class required)`**\n\n"
+        f"*Save your expressions from the Photo Booth to build a personal dataset, then run `python fine_tune.py` to adapt the model to your camera!*"
     )
     return total_count, per_class, status_md
+
+# Backward compatibility alias
+get_community_counter_stats = get_local_dataset_stats
+
 
 
 def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
@@ -270,21 +270,16 @@ def process_booth_frame(frame, booth_state):
 def use_sample_face(emotion, booth_state):
     """
     UX Fail-Safe: Fills an emotion slot (e.g. Disgust or Fear) with a benchmark
-    test image so the user is never blocked from completing their strip.
+    sample face from assets/samples/ so the user can complete their photo strip.
     """
     if booth_state is None:
         booth_state = init_booth_state()
 
     sample_path = os.path.join("assets", "samples", f"{emotion.lower()}.jpg")
-    if not os.path.exists(sample_path):
-        src_dir = os.path.join("dataset", "test", emotion.lower())
-        if os.path.exists(src_dir):
-            files = os.listdir(src_dir)
-            if files:
-                sample_path = os.path.join(src_dir, files[0])
-
     if os.path.exists(sample_path):
         img_bgr = cv2.imread(sample_path)
+        # Smoothly upscale to standard portrait dimensions so it renders cleanly
+        img_bgr = cv2.resize(img_bgr, (240, 240), interpolation=cv2.INTER_CUBIC)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         gate = EMPIRICAL_THRESHOLDS.get(emotion, 0.40)
         booth_state[emotion] = {
@@ -313,11 +308,11 @@ def use_sample_face(emotion, booth_state):
 
 def save_and_contribute(booth_state, consent_given):
     """
-    Active Learning Engine: Appends verified facial crops to dataset/user_contributed/
+    Local Active Learning: Appends verified facial crops to dataset/user_contributed/
     and logs metadata using append-only JSON Lines format.
     """
     if not consent_given:
-        return "⚠️ Please check the consent box to contribute your expressions.", gr.skip()
+        return "⚠️ Please check the confirmation box to save your expressions locally.", gr.skip()
 
     if booth_state is None:
         return "⚠️ No expressions captured yet in this session.", gr.skip()
@@ -351,14 +346,15 @@ def save_and_contribute(booth_state, consent_given):
 
             saved_count += 1
 
-    _, _, updated_banner = get_community_counter_stats()
+    _, _, updated_banner = get_local_dataset_stats()
 
     if saved_count > 0:
-        feedback = f"✅ Successfully contributed **{saved_count}** expression(s) to the local dataset! Community milestone updated."
+        feedback = f"✅ Successfully saved **{saved_count}** expression(s) locally to `dataset/user_contributed/`! Ready for fine-tuning."
     else:
-        feedback = "ℹ️ No new live facial expressions were ready to contribute (benchmark samples are excluded from training)."
+        feedback = "ℹ️ No new live facial expressions were ready to save (benchmark samples are excluded from fine-tuning)."
 
     return feedback, updated_banner
+
 
 
 def generate_photo_strip(booth_state):
@@ -540,8 +536,8 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
     with gr.Tabs():
         # TAB 1: 📸 Emotion Photo Booth & Active Learning
         with gr.TabItem("📸 Emotion Photo Booth"):
-            # Dynamic Community Milestone Banner
-            _, _, banner_text = get_community_counter_stats()
+            # Dynamic Local Active Learning Status
+            _, _, banner_text = get_local_dataset_stats()
             community_banner = gr.Markdown(banner_text, elem_classes=["community-card"])
 
             gr.Markdown(
@@ -585,13 +581,14 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
 
                     # Active Learning Contribution Box
                     with gr.Group():
-                        gr.Markdown("#### 🤝 Join the EdgeVision v2.0 Community Training Flywheel")
+                        gr.Markdown("#### 💾 Personal Dataset Builder for Fine-Tuning")
                         consent_box = gr.Checkbox(
-                            label="I consent to contributing my cropped portraits to the local EdgeVision training pool (stored append-only in dataset/user_contributed/metadata.jsonl)",
+                            label="Save captured face crops to dataset/user_contributed/ (stored locally on your machine for fine_tune.py)",
                             value=True
                         )
-                        contribute_btn = gr.Button("💾 Contribute My Verified Faces to v2.0 Dataset", variant="secondary")
+                        contribute_btn = gr.Button("💾 Save Captured Faces to Local Dataset", variant="secondary")
                         contribute_feedback = gr.Markdown("")
+
 
             # Event bindings
             booth_stream.stream(

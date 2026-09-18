@@ -2,9 +2,9 @@
 EdgeVision Active Learning: Fine-Tuning Engine with Production Guardrails
 Enforces 4 strict guardrails:
 1. Minimum Volume Gate (>= 10 samples per emotion class before training)
-2. 15x Oversampling of User Data (prevents drowning by 28k legacy FER samples)
+2. Oversampled Blended Data Generator (actually mixes user data into every gradient step)
 3. Heavy Augmentation Pipeline (rotation, flip, zoom, brightness)
-4. Empirical Before/After Test Evaluation with Safety Rollback
+4. Empirical Before/After Test Evaluation with Immutable Baseline Rollback
 """
 
 import os
@@ -33,6 +33,7 @@ METADATA_JSONL = os.path.join(USER_CONTRIB_DIR, 'metadata.jsonl')
 BASE_TRAIN_DIR = 'dataset/train'
 TEST_DIR = 'dataset/test'
 MODEL_PATH = 'model/emotion_model.keras'
+ORIGINAL_MODEL_PATH = 'model/emotion_model_original.keras'
 BACKUP_MODEL_PATH = 'model/emotion_model_backup.keras'
 FINETUNED_MODEL_PATH = 'model/emotion_model_finetuned.keras'
 REPORT_PATH = 'outputs/fine_tune_report.json'
@@ -40,6 +41,13 @@ INDICES_PATH = 'outputs/class_indices.json'
 
 MIN_SAMPLES_PER_CLASS = 10
 USER_OVERSAMPLE_FACTOR = 15
+
+
+def ensure_original_baseline():
+    """Ensures an immutable original baseline model checkpoint exists on disk."""
+    if not os.path.exists(ORIGINAL_MODEL_PATH) and os.path.exists(MODEL_PATH):
+        shutil.copyfile(MODEL_PATH, ORIGINAL_MODEL_PATH)
+        print(f"[INIT] Preserved immutable ground truth model at: {ORIGINAL_MODEL_PATH}")
 
 
 def check_guardrails(force=False):
@@ -65,9 +73,9 @@ def check_guardrails(force=False):
                 counts[emo] = len(valid_files)
 
     print("\n" + "=" * 60)
-    print("[GUARDRAIL 1] COMMUNITY DATA VOLUME AUDIT")
+    print("[GUARDRAIL 1] LOCAL USER DATA VOLUME AUDIT")
     print("=" * 60)
-    print(f"{'Emotion':<15} | {'Contributed':<12} | {'Requirement':<12} | {'Status'}")
+    print(f"{'Emotion':<15} | {'Collected':<12} | {'Requirement':<12} | {'Status'}")
     print("-" * 60)
 
     failing_classes = []
@@ -80,15 +88,15 @@ def check_guardrails(force=False):
     print("-" * 60)
 
     total_contributed = sum(counts.values())
-    print(f"Total Contributed Faces: {total_contributed}")
+    print(f"Total Collected Faces: {total_contributed}")
 
     if failing_classes and not force:
         print("\n[BLOCKED] Fine-Tuning Blocked by Active Learning Guardrails!")
-        print("To protect model generalization and prevent catastrophic overfitting,")
-        print(f"every class requires at least {MIN_SAMPLES_PER_CLASS} verified user samples.")
+        print("To protect model generalization and prevent overfitting on small samples,")
+        print(f"each class requires at least {MIN_SAMPLES_PER_CLASS} verified local samples.")
         print(f"Missing quota for: {', '.join([f'{e} ({c}/{MIN_SAMPLES_PER_CLASS})' for e, c in failing_classes])}")
-        print("\n>> Action: Launch the Photo Booth (`python app.py`) and capture additional expressions,")
-        print("or pass `--force` if executing a smoke test or dry run.")
+        print("\n>> Action: Open the Photo Booth (`python app.py`) to capture additional expressions,")
+        print("or pass `--force` if executing a smoke test.")
         return False, counts
 
     if failing_classes and force:
@@ -151,13 +159,62 @@ def load_and_preprocess_user_data(class_indices):
     return np.array(x_user, dtype=np.float32), np.array(y_user, dtype=np.float32)
 
 
+def create_blended_generator(base_gen, x_user, y_user, datagen, batch_size=32, user_ratio=0.25):
+    """
+    Guardrail 2: Blended Generator that actively injects augmented user data
+    into every training batch alongside base FER2013 samples.
+    """
+    if len(x_user) == 0:
+        return base_gen
+
+    user_batch_size = max(1, int(batch_size * user_ratio))
+    base_batch_size = max(1, batch_size - user_batch_size)
+
+    user_flow = datagen.flow(
+        x_user, y_user,
+        batch_size=user_batch_size,
+        shuffle=True
+    )
+
+    def _generator():
+        while True:
+            base_x, base_y = next(base_gen)
+            user_x, user_y = next(user_flow)
+
+            bx = base_x[:base_batch_size]
+            by = base_y[:base_batch_size]
+
+            merged_x = np.concatenate([bx, user_x], axis=0)
+            merged_y = np.concatenate([by, user_y], axis=0)
+
+            # Shuffle combined batch
+            indices = np.arange(len(merged_x))
+            np.random.shuffle(indices)
+
+            yield merged_x[indices], merged_y[indices]
+
+    return _generator()
+
+
 def main():
     parser = argparse.ArgumentParser(description="EdgeVision Fine-Tuning Engine with Guardrails")
     parser.add_argument("--force", action="store_true", help="Bypass the minimum volume gate for testing")
+    parser.add_argument("--reset", action="store_true", help="Restore production model from pristine original baseline")
     parser.add_argument("--epochs", type=int, default=15, help="Number of fine-tuning epochs (default: 15)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for fine-tuning (default: 5e-5)")
     args = parser.parse_args()
+
+    ensure_original_baseline()
+
+    if args.reset:
+        if os.path.exists(ORIGINAL_MODEL_PATH):
+            shutil.copyfile(ORIGINAL_MODEL_PATH, MODEL_PATH)
+            print(f"[SUCCESS] Restored {MODEL_PATH} from immutable original baseline: {ORIGINAL_MODEL_PATH}")
+            return
+        else:
+            print(f"[ERROR] Original baseline {ORIGINAL_MODEL_PATH} not found.")
+            sys.exit(1)
 
     os.makedirs('outputs', exist_ok=True)
     os.makedirs('model', exist_ok=True)
@@ -181,13 +238,13 @@ def main():
     print(f"[METRIC] Baseline Test Accuracy: {base_acc*100:.2f}%")
 
     # -------------------------------------------------------------
-    # Guardrail 2: Oversample User Contributed Samples
+    # Guardrail 2: Oversample & Prepare User Data
     # -------------------------------------------------------------
     x_user, y_user = load_and_preprocess_user_data(class_indices)
     print(f"\nUser Data Loaded: {len(x_user)} verified portraits.")
 
     if len(x_user) > 0:
-        print(f"Applying Guardrail 2: {USER_OVERSAMPLE_FACTOR}x Oversampling on user-contributed data...")
+        print(f"Applying Guardrail 2: {USER_OVERSAMPLE_FACTOR}x Oversampling on user data...")
         x_user_oversampled = np.repeat(x_user, USER_OVERSAMPLE_FACTOR, axis=0)
         y_user_oversampled = np.repeat(y_user, USER_OVERSAMPLE_FACTOR, axis=0)
         print(f"Effective User Training Volume: {len(x_user_oversampled)} samples.")
@@ -229,6 +286,20 @@ def main():
         shuffle=False
     )
 
+    # Actively blend user-contributed images with base images
+    if len(x_user_oversampled) > 0:
+        print("Blending user data into active training pipeline (25% user / 75% base per batch)...")
+        train_pipeline = create_blended_generator(
+            base_train_gen,
+            x_user_oversampled,
+            y_user_oversampled,
+            train_datagen,
+            batch_size=args.batch_size,
+            user_ratio=0.25
+        )
+    else:
+        train_pipeline = base_train_gen
+
     # Compile with low learning rate for gentle fine-tuning
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
     baseline_model.compile(
@@ -247,9 +318,12 @@ def main():
     print(f"Epochs: {args.epochs} | LR: {args.lr} | Batch Size: {args.batch_size}")
     print("=" * 60)
 
-    # Train for specified epochs
+    steps_per_epoch = len(base_train_gen)
+
+    # Train for specified epochs using blended pipeline
     history = baseline_model.fit(
-        base_train_gen,
+        train_pipeline,
+        steps_per_epoch=steps_per_epoch,
         epochs=args.epochs,
         validation_data=val_gen,
         callbacks=callbacks,
@@ -289,7 +363,7 @@ def main():
     print(f"Candidate model weights saved to: {FINETUNED_MODEL_PATH}")
 
     if delta >= 0:
-        print("\n[SUCCESS] Model generalized well or improved! Promoting to production weights...")
+        print("\n[SUCCESS] Model maintained/improved test accuracy! Promoting weights...")
         shutil.copyfile(MODEL_PATH, BACKUP_MODEL_PATH)
         baseline_model.save(MODEL_PATH)
         print(f"Previous production weights backed up to: {BACKUP_MODEL_PATH}")
@@ -298,6 +372,7 @@ def main():
         print(f"\n[ROLLBACK SAFETY] Accuracy dropped by {abs(delta)*100:.2f}%.")
         print(f"Production weights in {MODEL_PATH} remain UNTOUCHED.")
         print(f"Fine-tuned candidate is preserved in {FINETUNED_MODEL_PATH} for inspection.")
+        print(f"Note: You can restore pristine baseline anytime via: python fine_tune.py --reset")
 
     print(f"Audit report written to {REPORT_PATH}.\n")
 
