@@ -27,7 +27,12 @@ jobs:
 
     - name: Syntax & Code Compilation
       run: |
-        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py
+        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py
+
+    - name: Run Pytest Test Suite
+      run: |
+        pytest tests/ -v
+
 
     - name: Smoke Test Model & Class Mappings
       run: |

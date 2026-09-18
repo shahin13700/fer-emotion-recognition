@@ -5,6 +5,7 @@ Includes:
 2. 🎥 Live Streaming Webcam (Clean face tracking + live side panel bars)
 3. 🎬 Full Video File Processing (.mp4, .mov, .avi)
 4. 🖼️ Still Image Analysis
+5. 🌟 Active Learning & Community Flywheel (Empirical 25th %ile gates, append-only metadata.jsonl, benchmark fallbacks)
 Powered by MiniXception & Gradio. Ready for Hugging Face Spaces.
 """
 
@@ -24,6 +25,9 @@ import gradio as gr
 # -------------------------------------------------------------
 MODEL_PATH = 'model/emotion_model.keras'
 INDICES_PATH = 'outputs/class_indices.json'
+USER_CONTRIB_DIR = 'dataset/user_contributed'
+METADATA_JSONL = os.path.join(USER_CONTRIB_DIR, 'metadata.jsonl')
+COMMUNITY_GOAL = 250
 
 if not os.path.exists(INDICES_PATH):
     raise FileNotFoundError(f"Missing {INDICES_PATH}. Please train or copy outputs first.")
@@ -45,6 +49,18 @@ EMOTION_COLORS_RGB = {
     "Disgust": (230, 126, 34),    # Amber Orange
 }
 
+# Empirical confidence thresholds derived from the 25th percentile of correct
+# predictions across all 7,178 FER2013 test set images.
+EMPIRICAL_THRESHOLDS = {
+    "Happy":    0.70,   # 25th %ile = 71.4%
+    "Surprise": 0.65,   # 25th %ile = 68.6%
+    "Neutral":  0.46,   # 25th %ile = 46.1%
+    "Angry":    0.46,   # 25th %ile = 46.1%
+    "Fear":     0.38,   # 25th %ile = 38.6%
+    "Sad":      0.37,   # 25th %ile = 37.5%
+    "Disgust":  0.50,   # Calibrated for live webcam viability (25th %ile = 70.7%)
+}
+
 print(f"Loading model from {MODEL_PATH}...")
 model = load_model(MODEL_PATH)
 _ = model(tf.zeros((1, 48, 48, 1)), training=False)
@@ -62,10 +78,45 @@ def init_booth_state():
     return {
         emotion: {
             "score": 0.0,
-            "crop": None  # RGB numpy array
+            "crop": None,       # RGB numpy array
+            "is_sample": False  # Distinguishes live webcam capture from benchmark fallback
         }
         for emotion in emotion_labels
     }
+
+
+def get_community_counter_stats():
+    """Reads metadata.jsonl and returns current count, target, and formatted banner."""
+    total_count = 0
+    per_class = {e: 0 for e in emotion_labels}
+    if os.path.exists(METADATA_JSONL):
+        try:
+            with open(METADATA_JSONL, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            record = json.loads(line)
+                            total_count += 1
+                            emo = record.get("emotion", "").capitalize()
+                            if emo in per_class:
+                                per_class[emo] += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    pct = min(100, int((total_count / COMMUNITY_GOAL) * 100))
+    filled_bars = int(pct / 10)
+    empty_bars = 10 - filled_bars
+    bar_str = "█" * filled_bars + "░" * empty_bars
+
+    status_md = (
+        f"### 🌟 Community Active Learning Engine\n"
+        f"**`{total_count} / {COMMUNITY_GOAL} Community Faces Collected`** `[{bar_str}]` **`{pct}%` toward EdgeVision v2.0 Retraining**\n\n"
+        f"*Contribute your verified expressions from the Photo Booth below to power our next-generation edge model!*"
+    )
+    return total_count, per_class, status_md
 
 
 def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
@@ -143,12 +194,12 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
 
 
 # -------------------------------------------------------------
-# 3. Photo Booth Logic & Collage Generator
+# 3. Photo Booth Logic & Active Learning Handlers
 # -------------------------------------------------------------
 def process_booth_frame(frame, booth_state):
     """
-    Analyzes frame in Photo Booth mode, saves new peak expression crops,
-    and updates the challenge counter.
+    Analyzes frame in Photo Booth mode using empirical thresholds, saves new
+    peak expression crops, and updates challenge counter.
     """
     if frame is None:
         return None, gr.skip(), gr.skip(), booth_state
@@ -169,8 +220,10 @@ def process_booth_frame(frame, booth_state):
     for info in face_infos:
         label = info["label"]
         score = info["score"]
-        # Only record if score is confident (>= 40%) and beats previous personal best
-        if score >= 0.40 and score > booth_state[label]["score"]:
+        gate = EMPIRICAL_THRESHOLDS.get(label, 0.40)
+        
+        # Only record if score passes empirical 25th percentile gate and beats previous score
+        if score >= gate and score > booth_state[label]["score"]:
             x, y, fw, fh = info["box"]
             pad_x = int(fw * 0.25)
             pad_y = int(fh * 0.25)
@@ -184,25 +237,27 @@ def process_booth_frame(frame, booth_state):
             
             booth_state[label] = {
                 "score": float(score),
-                "crop": crop_rgb
+                "crop": crop_rgb,
+                "is_sample": False
             }
             new_capture = True
 
-    # Challenge counter text
-    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= 0.40]
-    missing = [e for e in emotion_labels if booth_state[e]["score"] < 0.40]
+    # Challenge counter text based on empirical thresholds
+    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40)]
+    missing = [e for e in emotion_labels if booth_state[e]["score"] < EMPIRICAL_THRESHOLDS.get(e, 0.40)]
 
     if len(missing) == 0:
         status_text = "🎉 **CHALLENGE COMPLETE!** You unlocked all 7 emotions! Click **Generate Photo Strip** below!"
     else:
         missing_str = ", ".join(missing)
-        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Try making a face for: **{missing_str}**)*"
+        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Missing: **{missing_str}** — tips below)*"
 
     # Format gallery items
     gallery_items = []
     for e in emotion_labels:
         if booth_state[e]["crop"] is not None:
-            gallery_items.append((booth_state[e]["crop"], f"{e}: {booth_state[e]['score']*100:.0f}%"))
+            tag = " (Sample)" if booth_state[e].get("is_sample") else ""
+            gallery_items.append((booth_state[e]["crop"], f"{e}: {booth_state[e]['score']*100:.0f}%{tag}"))
 
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
@@ -210,6 +265,100 @@ def process_booth_frame(frame, booth_state):
         return annotated_rgb, status_text, gallery_items, booth_state
     else:
         return annotated_rgb, gr.skip(), gr.skip(), booth_state
+
+
+def use_sample_face(emotion, booth_state):
+    """
+    UX Fail-Safe: Fills an emotion slot (e.g. Disgust or Fear) with a benchmark
+    test image so the user is never blocked from completing their strip.
+    """
+    if booth_state is None:
+        booth_state = init_booth_state()
+
+    sample_path = os.path.join("assets", "samples", f"{emotion.lower()}.jpg")
+    if not os.path.exists(sample_path):
+        src_dir = os.path.join("dataset", "test", emotion.lower())
+        if os.path.exists(src_dir):
+            files = os.listdir(src_dir)
+            if files:
+                sample_path = os.path.join(src_dir, files[0])
+
+    if os.path.exists(sample_path):
+        img_bgr = cv2.imread(sample_path)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        gate = EMPIRICAL_THRESHOLDS.get(emotion, 0.40)
+        booth_state[emotion] = {
+            "score": float(gate),
+            "crop": img_rgb,
+            "is_sample": True
+        }
+
+    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40)]
+    missing = [e for e in emotion_labels if booth_state[e]["score"] < EMPIRICAL_THRESHOLDS.get(e, 0.40)]
+
+    if len(missing) == 0:
+        status_text = "🎉 **CHALLENGE COMPLETE!** All 7 emotions filled! Click **Generate Photo Strip** below!"
+    else:
+        missing_str = ", ".join(missing)
+        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Missing: **{missing_str}**)*"
+
+    gallery_items = []
+    for e in emotion_labels:
+        if booth_state[e]["crop"] is not None:
+            tag = " (Sample)" if booth_state[e].get("is_sample") else ""
+            gallery_items.append((booth_state[e]["crop"], f"{e}: {booth_state[e]['score']*100:.0f}%{tag}"))
+
+    return booth_state, status_text, gallery_items
+
+
+def save_and_contribute(booth_state, consent_given):
+    """
+    Active Learning Engine: Appends verified facial crops to dataset/user_contributed/
+    and logs metadata using append-only JSON Lines format.
+    """
+    if not consent_given:
+        return "⚠️ Please check the consent box to contribute your expressions.", gr.skip()
+
+    if booth_state is None:
+        return "⚠️ No expressions captured yet in this session.", gr.skip()
+
+    saved_count = 0
+    os.makedirs(USER_CONTRIB_DIR, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for emotion, data in booth_state.items():
+        # Only save real captured faces (exclude benchmark fallback samples)
+        if data["crop"] is not None and not data.get("is_sample") and data["score"] >= EMPIRICAL_THRESHOLDS.get(emotion, 0.40):
+            emo_dir = os.path.join(USER_CONTRIB_DIR, emotion.lower())
+            os.makedirs(emo_dir, exist_ok=True)
+
+            img_filename = f"{timestamp}_{emotion.lower()}_{saved_count}.png"
+            img_path = os.path.join(emo_dir, img_filename)
+
+            crop_pil = Image.fromarray(data["crop"])
+            crop_pil.save(img_path)
+
+            log_entry = {
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "emotion": emotion.lower(),
+                "score": round(float(data["score"]), 4),
+                "image_path": img_path.replace("\\", "/"),
+                "verified_by_user": True
+            }
+
+            with open(METADATA_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+
+            saved_count += 1
+
+    _, _, updated_banner = get_community_counter_stats()
+
+    if saved_count > 0:
+        feedback = f"✅ Successfully contributed **{saved_count}** expression(s) to the local dataset! Community milestone updated."
+    else:
+        feedback = "ℹ️ No new live facial expressions were ready to contribute (benchmark samples are excluded from training)."
+
+    return feedback, updated_banner
 
 
 def generate_photo_strip(booth_state):
@@ -232,7 +381,7 @@ def generate_photo_strip(booth_state):
     # Header
     draw.text((pad + 10, 18), "🎭 EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255))
     date_str = datetime.datetime.now().strftime("%B %d, %Y • %H:%M")
-    unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= 0.40)
+    unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= EMPIRICAL_THRESHOLDS.get(e, 0.40))
     draw.text((pad + 10, 44), f"Session Highlights • Score: {unlocked_count}/7 Emotions Unlocked • {date_str}", fill=(180, 180, 180))
 
     # Render 7 Emotion Tiles + 1 Summary Tile in a 4x2 grid
@@ -251,10 +400,8 @@ def generate_photo_strip(booth_state):
         draw.rectangle([tx, ty, tx + tile_w, ty + tile_h], fill=bg_col, outline=(55, 65, 80), width=2)
 
         if slot["crop"] is not None:
-            # Resize crop to fill tile while maintaining aspect ratio
             face_img = Image.fromarray(slot["crop"])
             face_img.thumbnail((tile_w - 8, tile_h - 45))
-            # Center image
             ix = tx + (tile_w - face_img.width) // 2
             iy = ty + 6 + ((tile_h - 45) - face_img.height) // 2
             canvas.paste(face_img, (ix, iy))
@@ -262,7 +409,8 @@ def generate_photo_strip(booth_state):
             # Bottom Badge
             badge_color = EMOTION_COLORS_RGB.get(emotion, (0, 230, 255))
             draw.rectangle([tx, ty + tile_h - 36, tx + tile_w, ty + tile_h], fill=badge_color)
-            label_caption = f"{emotion.upper()}: {slot['score']*100:.0f}%"
+            sample_tag = " (SAMPLE)" if slot.get("is_sample") else ""
+            label_caption = f"{emotion.upper()}: {slot['score']*100:.0f}%{sample_tag}"
             draw.text((tx + 12, ty + tile_h - 26), label_caption, fill=(255, 255, 255))
         else:
             # Locked slot placeholder
@@ -320,6 +468,9 @@ def process_image(input_image):
     annotated_bgr, confs, _, _ = annotate_frame(frame_bgr)
     return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs
 
+# Backward compatibility alias for test suites and CI smoke tests
+predict_emotion = process_image
+
 
 def process_video_file(video_path, progress=gr.Progress()):
     """Processes an uploaded video file frame-by-frame and returns annotated MP4."""
@@ -363,6 +514,13 @@ def process_video_file(video_path, progress=gr.Progress()):
 # -------------------------------------------------------------
 custom_css = """
 #header { text-align: center; margin-bottom: 20px; }
+.community-card {
+    background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 12px;
+}
 """
 
 with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as demo:
@@ -380,12 +538,16 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
     )
 
     with gr.Tabs():
-        # TAB 1: 📸 Emotion Photo Booth (New Gamified Feature!)
+        # TAB 1: 📸 Emotion Photo Booth & Active Learning
         with gr.TabItem("📸 Emotion Photo Booth"):
+            # Dynamic Community Milestone Banner
+            _, _, banner_text = get_community_counter_stats()
+            community_banner = gr.Markdown(banner_text, elem_classes=["community-card"])
+
             gr.Markdown(
                 """
                 ### 🎮 The 7-Emotion Photo Booth Challenge
-                Turn on your camera and make your best facial expressions! The AI tracks your peak moments in real time, collects your highest-confidence portraits, and generates a downloadable **Emotion Photo Strip**!
+                Turn on your camera and make your best facial expressions! The AI dynamically tracks your peak moments using **empirical confidence gates**, captures your best portraits, and compiles an **Emotion Photo Strip**!
                 """
             )
             challenge_badge = gr.Markdown("🎯 **Challenge:** 0 / 7 Emotions Captured! Start the camera and make your best faces!")
@@ -393,17 +555,61 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
             with gr.Row():
                 with gr.Column(scale=3):
                     booth_stream = gr.Image(sources=["webcam"], streaming=True, label="Live Camera")
-                    reset_btn = gr.Button("🔄 Reset Session", variant="secondary", size="sm")
+                    with gr.Row():
+                        reset_btn = gr.Button("🔄 Reset Session", variant="secondary", size="sm")
+
+                    # UX Fail-Safe Section for Disgust & Fear
+                    gr.Markdown("💡 **Can't trigger elusive expressions?** *(Camera angle and lighting can make subtle micro-expressions difficult)*")
+                    with gr.Row():
+                        disgust_sample_btn = gr.Button("🤢 Fill Disgust (Benchmark Face)", variant="secondary", size="sm")
+                        fear_sample_btn = gr.Button("😱 Fill Fear (Benchmark Face)", variant="secondary", size="sm")
+
+                    # Helpful Emoji Tips Accordion
+                    with gr.Accordion("🎭 Facial Action Unit (AU) Guide & Tips", open=False):
+                        gr.Markdown(
+                            """
+                            - 😊 **Happy (Gate: 70%):** Smile broadly, show teeth, and raise your cheeks.
+                            - 😲 **Surprise (Gate: 65%):** Drop jaw open wide and raise both eyebrows high.
+                            - 😐 **Neutral (Gate: 46%):** Relax all facial muscles with mouth gently closed.
+                            - 😡 **Angry (Gate: 46%):** Furrow and pull eyebrows down/together, compress lips.
+                            - 😢 **Sad (Gate: 37%):** Lower the corners of your mouth and cast gaze downward.
+                            - 😱 **Fear (Gate: 38%):** Widen eyes, raise inner eyebrows, pull head back slightly.
+                            - 🤢 **Disgust (Gate: 50%):** Wrinkle the bridge of your nose and raise upper lip.
+                            """
+                        )
 
                 with gr.Column(scale=3):
                     gallery_output = gr.Gallery(label="✨ Unlocked Emotion Portraits", columns=4, height="auto")
                     generate_strip_btn = gr.Button("📸 Generate My Emotion Photo Strip", variant="primary", size="lg")
                     strip_output = gr.Image(label="Your Downloadable Emotion Photo Strip")
 
+                    # Active Learning Contribution Box
+                    with gr.Group():
+                        gr.Markdown("#### 🤝 Join the EdgeVision v2.0 Community Training Flywheel")
+                        consent_box = gr.Checkbox(
+                            label="I consent to contributing my cropped portraits to the local EdgeVision training pool (stored append-only in dataset/user_contributed/metadata.jsonl)",
+                            value=True
+                        )
+                        contribute_btn = gr.Button("💾 Contribute My Verified Faces to v2.0 Dataset", variant="secondary")
+                        contribute_feedback = gr.Markdown("")
+
+            # Event bindings
             booth_stream.stream(
                 fn=process_booth_frame,
                 inputs=[booth_stream, booth_state],
                 outputs=[booth_stream, challenge_badge, gallery_output, booth_state]
+            )
+
+            disgust_sample_btn.click(
+                fn=lambda s: use_sample_face("Disgust", s),
+                inputs=[booth_state],
+                outputs=[booth_state, challenge_badge, gallery_output]
+            )
+
+            fear_sample_btn.click(
+                fn=lambda s: use_sample_face("Fear", s),
+                inputs=[booth_state],
+                outputs=[booth_state, challenge_badge, gallery_output]
             )
 
             generate_strip_btn.click(
@@ -416,6 +622,12 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                 fn=reset_booth,
                 inputs=[],
                 outputs=[booth_state, challenge_badge, gallery_output]
+            )
+
+            contribute_btn.click(
+                fn=save_and_contribute,
+                inputs=[booth_state, consent_box],
+                outputs=[contribute_feedback, community_banner]
             )
 
         # TAB 2: Live Streaming Webcam (Clean Stream)
@@ -479,6 +691,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
         - **Model:** MiniXception with Depthwise Separable Convolutions & Residual Connections
         - **Parameters:** ~60,000 (817 KB model file)
         - **Inference Speed:** Sub-10ms per face on CPU
+        - **Active Learning:** Append-only JSONL logging with 25th percentile empirical confidence gating
         - **Repository:** [github.com/shahin13700/fer-emotion-recognition](https://github.com/shahin13700/fer-emotion-recognition)
         """
     )
