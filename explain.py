@@ -162,7 +162,6 @@ def main(output_dir='outputs/gradcam_samples', model_path='model/emotion_model.k
             found = True
 
     fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)), squeeze=False)
-    plt.subplots_adjust(hspace=0.4, wspace=0.2)
     n_correct = 0
 
     for i, emotion in enumerate(emotions):
@@ -209,10 +208,11 @@ def main(output_dir='outputs/gradcam_samples', model_path='model/emotion_model.k
                              color=("black" if correct else "firebrick"))
         axes[i, 2].axis('off')
 
-    plt.suptitle(f"MiniXception Grad-CAM ({fmap_shape[1]}x{fmap_shape[2]} attribution grid) — "
-                 f"{n_correct}/{len(emotions)} samples classified correctly", fontsize=12, y=1.002)
+    fig.suptitle(f"MiniXception Grad-CAM ({fmap_shape[1]}x{fmap_shape[2]} attribution grid) — "
+                 f"{n_correct}/{len(emotions)} samples classified correctly", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     save_path = os.path.join(output_dir, 'gradcam_gallery.png')
-    plt.savefig(save_path, dpi=180, bbox_inches='tight')
+    plt.savefig(save_path, dpi=180, bbox_inches='tight', pad_inches=0.15)
     plt.close()
 
     print(f"Grad-CAM analysis complete! {n_correct}/{len(emotions)} samples correct. Gallery saved to {save_path}")

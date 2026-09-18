@@ -220,3 +220,7 @@ outputs/history.pkl
 outputs/accuracy_curve.png
 outputs/loss_curve.png
 outputs/confusion_matrix.png
+
+# MediaPipe Face Landmarker asset (downloaded on first run of monitor.py)
+model/face_landmarker.task
+model/face_landmarker.task.part

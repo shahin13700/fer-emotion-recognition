@@ -65,6 +65,8 @@ def main():
 
     # Temporal smoothing buffer to eliminate real-time prediction flicker
     smoothed_preds = None
+    missed_frames = 0
+    ema_reset_after_misses = 30  # ~1 s without a face before the smoother is reset
     alpha = 0.65  # Weight for current frame (0.65 balances responsiveness and stability)
 
     # -------------------------------------------------------------
@@ -87,7 +89,13 @@ def main():
         )
 
         if len(faces) == 0:
-            smoothed_preds = None  # Reset smoother when face leaves frame
+            # Keep the smoother through brief detection dropouts; only reset once the face
+            # has really left, otherwise the first frame back is a raw, unsmoothed spike.
+            missed_frames += 1
+            if missed_frames >= ema_reset_after_misses:
+                smoothed_preds = None
+        else:
+            missed_frames = 0
 
         # Sort detected faces by area descending so primary face is index 0
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)

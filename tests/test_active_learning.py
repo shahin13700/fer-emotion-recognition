@@ -36,7 +36,9 @@ def test_init_booth_state():
     for emo, data in state.items():
         assert data["score"] == 0.0
         assert data["crop"] is None
+        assert data["train_crop"] is None
         assert data["is_sample"] is False
+        assert data["saved"] is False
 
 
 def test_use_sample_face_disgust_and_fear():
@@ -46,11 +48,12 @@ def test_use_sample_face_disgust_and_fear():
     updated_state, status, gallery = app.use_sample_face("Disgust", state)
     assert updated_state["Disgust"]["crop"] is not None
     assert updated_state["Disgust"]["is_sample"] is True
-    assert updated_state["Disgust"]["score"] == app.EMPIRICAL_THRESHOLDS["Disgust"]
+    assert updated_state["Disgust"]["score"] >= app.MIN_CAPTURE_FLOOR
     h, w, c = updated_state["Disgust"]["crop"].shape
     assert h >= 100 and w >= 100
     assert len(gallery) >= 1
-    assert "(Sample)" in gallery[0][1]
+    # Sample tiles carry no confidence number: the model does not predict that emotion for them
+    assert gallery[0][1] == "Disgust (Sample)"
 
     updated_state, status, gallery = app.use_sample_face("Fear", updated_state)
     assert updated_state["Fear"]["crop"] is not None
@@ -70,10 +73,12 @@ def test_metadata_jsonl_append_and_parsing(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "ALLOW_LOCAL_SAVE", True)
 
     state = app.init_booth_state()
-    state["Happy"] = {"score": 0.85, "crop": np.zeros((100, 100, 3), dtype=np.uint8), "is_sample": False}
+    tight = np.full((60, 60), 77, dtype=np.uint8)
+    state["Happy"] = {**app.empty_slot(), "score": 0.85, "crop": np.zeros((100, 100, 3), dtype=np.uint8),
+                      "train_crop": tight, "label_source": "model_argmax"}
 
     feedback, banner = app.save_and_contribute(state, consent_given=True)
-    assert "Successfully saved" in feedback
+    assert "Saved **1**" in feedback
     assert os.path.exists(fake_jsonl)
 
     with open(fake_jsonl, "r", encoding="utf-8") as f:
@@ -82,9 +87,31 @@ def test_metadata_jsonl_append_and_parsing(tmp_path, monkeypatch):
     record = json.loads(lines[0])
     assert record["emotion"] == "happy"
     assert record["score"] == 0.85
-    assert record["verified_by_user"] is True
+    assert record["consent_given"] is True
+    assert record["label_source"] == "model_argmax"
+    assert "verified_by_user" not in record
     assert record["timestamp"].endswith("+00:00")
     assert os.path.exists(record["image_path"])
+    # The TIGHT grayscale crop (what the model classified) is what gets saved, not the padded RGB display crop
+    saved = np.array(Image.open(record["image_path"]))
+    assert saved.shape == (60, 60) and saved.max() == 77
+
+
+def test_repeated_save_does_not_duplicate(tmp_path, monkeypatch):
+    """Clicking Save twice must not write a second copy (would defeat the fine-tune volume gate)."""
+    fake_contrib_dir = str(tmp_path / "user_contributed")
+    monkeypatch.setattr(app, "USER_CONTRIB_DIR", fake_contrib_dir)
+    monkeypatch.setattr(app, "METADATA_JSONL", os.path.join(fake_contrib_dir, "metadata.jsonl"))
+    monkeypatch.setattr(app, "ALLOW_LOCAL_SAVE", True)
+
+    state = app.init_booth_state()
+    state["Happy"] = {**app.empty_slot(), "score": 0.85, "crop": np.zeros((40, 40, 3), dtype=np.uint8),
+                      "train_crop": np.zeros((40, 40), dtype=np.uint8)}
+    app.save_and_contribute(state, consent_given=True)
+    feedback, _ = app.save_and_contribute(state, consent_given=True)
+    assert "already saved" in feedback
+    assert len(os.listdir(os.path.join(fake_contrib_dir, "happy"))) == 1
+    assert state["Happy"]["saved"] is True
 
 
 def test_samples_excluded_from_contribution(tmp_path, monkeypatch):
@@ -96,7 +123,7 @@ def test_samples_excluded_from_contribution(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "ALLOW_LOCAL_SAVE", True)
 
     state = app.init_booth_state()
-    state["Disgust"] = {"score": 0.50, "crop": np.zeros((100, 100, 3), dtype=np.uint8), "is_sample": True}
+    state["Disgust"] = {**app.empty_slot(), "score": 0.50, "crop": np.zeros((100, 100, 3), dtype=np.uint8), "is_sample": True}
 
     feedback, banner = app.save_and_contribute(state, consent_given=True)
     assert "benchmark samples are excluded" in feedback
@@ -111,7 +138,7 @@ def test_saving_disabled_on_shared_deployment(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "ALLOW_LOCAL_SAVE", False)
 
     state = app.init_booth_state()
-    state["Happy"] = {"score": 0.9, "crop": np.zeros((80, 80, 3), dtype=np.uint8), "is_sample": False}
+    state["Happy"] = {**app.empty_slot(), "score": 0.9, "crop": np.zeros((80, 80, 3), dtype=np.uint8)}
     feedback, _ = app.save_and_contribute(state, consent_given=True)
     assert "disabled" in feedback
     assert not os.path.exists(fake_contrib_dir)
@@ -178,17 +205,38 @@ def test_fine_tune_requires_base_dataset(tmp_path, monkeypatch):
         fine_tune.check_dataset_dirs()
 
 
-def test_user_data_loaded_as_raw_pixels(tmp_path, monkeypatch):
-    """User faces must be loaded in the 0-255 range; the generator does the rescaling."""
+def test_user_data_loaded_as_raw_pixels_like_inference(tmp_path, monkeypatch):
+    """User faces load in the 0-255 range with the same grayscale + INTER_AREA path app.py uses."""
     contrib = tmp_path / "user_contributed"
     (contrib / "happy").mkdir(parents=True)
-    Image.fromarray(np.full((60, 60), 200, dtype=np.uint8)).save(contrib / "happy" / "a.png")
+    rng = np.random.default_rng(3)
+    face = rng.integers(0, 255, (96, 96), dtype=np.uint8)
+    Image.fromarray(face).save(contrib / "happy" / "a.png")
     monkeypatch.setattr(fine_tune, "USER_CONTRIB_DIR", str(contrib))
 
     x, y = fine_tune.load_and_preprocess_user_data({"angry": 0, "happy": 1})
     assert x.shape == (1, 48, 48, 1) and y.shape == (1, 2)
-    assert x.max() > 1.0 and abs(float(x.mean()) - 200.0) < 1.0
+    assert x.max() > 1.0
     assert y[0, 1] == 1.0
+    expected = cv2.resize(face, (48, 48), interpolation=cv2.INTER_AREA).astype(np.float32)
+    assert np.array_equal(x[0, :, :, 0], expected), "fine_tune resize differs from the inference path"
+
+
+def test_duplicate_user_images_are_ignored(tmp_path, monkeypatch):
+    """Byte-identical copies must not count toward the volume gate nor enter the dataset twice."""
+    contrib = tmp_path / "user_contributed"
+    (contrib / "happy").mkdir(parents=True)
+    img = Image.fromarray(np.full((48, 48), 120, dtype=np.uint8))
+    for i in range(12):
+        img.save(contrib / "happy" / f"copy_{i}.png")       # 12 copies of ONE face
+    Image.fromarray(np.full((48, 48), 50, dtype=np.uint8)).save(contrib / "happy" / "other.png")
+    monkeypatch.setattr(fine_tune, "USER_CONTRIB_DIR", str(contrib))
+
+    passed, counts = fine_tune.check_guardrails(force=False)
+    assert counts["happy"] == 2
+    assert passed is False
+    x, _ = fine_tune.load_and_preprocess_user_data({"happy": 0})
+    assert len(x) == 2
 
 
 def test_blended_generator_with_real_augmentation_keeps_user_faces_visible():
@@ -226,6 +274,27 @@ def test_blended_generator_with_real_augmentation_keeps_user_faces_visible():
     assert np.allclose(batch_x[~user_mask], 0.1)
 
 
+def test_blended_generator_applies_class_weights_as_sample_weights():
+    """Keras 3 rejects class_weight for generators, so the balancing must ride along as sample weights."""
+    user_x = np.full((4, 48, 48, 1), 128, dtype=np.float32)
+    user_y = np.zeros((4, 7), dtype=np.float32); user_y[:, 1] = 1.0   # disgust
+
+    def base():
+        while True:
+            by = np.zeros((6, 7), dtype=np.float32); by[:, 3] = 1.0    # happy
+            yield np.full((6, 48, 48, 1), 0.5, dtype=np.float32), by
+
+    cw = {1: 9.4, 3: 0.57}
+    gen = fine_tune.create_blended_generator(base(), user_x, user_y, batch_size=8, user_ratio=0.25, class_weight=cw)
+    x, y, w = next(gen)
+    assert x.shape[0] == y.shape[0] == w.shape[0] == 8
+    assert np.allclose(w[y[:, 1] == 1], 9.4) and np.allclose(w[y[:, 3] == 1], 0.57)
+
+    # Without user data the base stream is still weighted
+    x, y, w = next(fine_tune.create_blended_generator(base(), np.empty((0, 48, 48, 1)), np.empty((0, 7)), class_weight=cw))
+    assert np.allclose(w, 0.57)
+
+
 def test_split_user_holdout_is_per_class_and_deterministic():
     """20% of each class with >= 5 samples is held out; tiny classes stay in training."""
     x = np.arange(25, dtype=np.float32).reshape(25, 1, 1, 1)
@@ -240,6 +309,25 @@ def test_split_user_holdout_is_per_class_and_deterministic():
     assert set(xt.ravel()) | set(xh.ravel()) == set(x.ravel())
     xt2, _, xh2, _ = fine_tune.split_user_holdout(x, y)
     assert np.array_equal(xh, xh2)
+
+
+def test_promotion_decision_catches_per_class_collapse():
+    """A candidate whose overall accuracy barely dips but whose Sad recall collapses is rejected."""
+    labels = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+    base = {"accuracy": 0.573, "macro_f1": 0.545, "recall": [0.54, 0.61, 0.30, 0.75, 0.61, 0.42, 0.75]}
+    collapsed = {"accuracy": 0.565, "macro_f1": 0.540,
+                 "recall": [0.54, 0.56, 0.26, 0.81, 0.61, 0.33, 0.75]}   # Sad -8.7pp, Disgust -5.4pp, Fear -4pp
+    promote, reasons = fine_tune.promotion_decision(base, collapsed, 0.5, 0.5, labels)
+    assert promote is False
+    assert any("sad" in r for r in reasons) and any("disgust" in r for r in reasons)
+
+    fine_ = {"accuracy": 0.571, "macro_f1": 0.544, "recall": [0.53, 0.60, 0.29, 0.76, 0.61, 0.41, 0.75]}
+    promote, reasons = fine_tune.promotion_decision(base, fine_, 0.5, 0.6, labels)
+    assert promote is True and reasons == []
+
+    # Regression on the user's own held-out faces is a hard no
+    promote, reasons = fine_tune.promotion_decision(base, fine_, 0.6, 0.5, labels)
+    assert promote is False and "held-out" in reasons[0]
 
 
 def test_original_model_preservation(tmp_path, monkeypatch):
@@ -331,6 +419,38 @@ def test_booth_crops_are_untainted(monkeypatch):
     cyan_pixels = np.all(captured_crop == [255, 230, 0], axis=-1)
     assert not np.any(cyan_pixels)
     assert ema is not None and abs(float(ema[3]) - 0.95) < 1e-6
+    # The tight training crop is the exact Haar box (60x60), grayscale, unpadded
+    assert new_state["Happy"]["train_crop"].shape == (60, 60)
+    assert new_state["Happy"]["label_source"] == "model_argmax"
+    # Padded display crop is bigger than the box
+    assert captured_crop.shape[0] > 60
+
+
+def test_sample_fill_does_not_block_live_capture(monkeypatch):
+    """A 'Fill Fear' sample must be replaced by any live Fear capture above the floor."""
+    state = app.init_booth_state()
+    state, _, _ = app.use_sample_face("Fear", state)
+    faces = [{"label": "Fear", "score": 0.34, "box": (10, 10, 50, 50), "train_crop": np.zeros((50, 50), np.uint8)}]
+    monkeypatch.setattr(app, "annotate_frame", lambda f, smoothed_preds=None, alpha=0.7: (f, {}, smoothed_preds, faces))
+    _, _, gallery, state, _ = app.process_booth_frame(np.full((120, 120, 3), 128, dtype=np.uint8), state)
+    assert state["Fear"]["is_sample"] is False
+    assert state["Fear"]["score"] == 0.34
+    assert "Fear: 34%" in gallery[0][1]
+
+
+def test_relabel_slot_moves_capture_and_marks_correction():
+    state = app.init_booth_state()
+    state["Surprise"] = {**app.empty_slot(), "score": 0.6, "crop": np.zeros((30, 30, 3), np.uint8),
+                         "train_crop": np.zeros((30, 30), np.uint8), "label_source": "model_argmax", "saved": True}
+    state, status, gallery, msg = app.relabel_slot(state, "Surprise", "Fear")
+    assert state["Surprise"]["crop"] is None
+    assert state["Fear"]["crop"] is not None
+    assert state["Fear"]["label_source"] == "user_corrected"
+    assert state["Fear"]["saved"] is False       # the corrected record still needs saving
+    assert "(relabelled)" in gallery[0][1]
+    # Samples and empty slots cannot be relabelled
+    state, _, _, msg = app.relabel_slot(state, "Happy", "Sad")
+    assert "no live capture" in msg
 
 
 def test_multi_face_temporal_smoothing_isolation(monkeypatch):
@@ -366,8 +486,8 @@ def test_booth_only_captures_primary_face(monkeypatch):
     """A bystander (secondary face) must never fill a booth slot."""
     frame = np.full((200, 200, 3), 128, dtype=np.uint8)
     faces = [
-        {"label": "Happy", "score": 0.9, "box": (60, 60, 80, 80)},
-        {"label": "Angry", "score": 0.9, "box": (10, 10, 40, 40)},
+        {"label": "Happy", "score": 0.9, "box": (60, 60, 80, 80), "train_crop": np.zeros((80, 80), np.uint8)},
+        {"label": "Angry", "score": 0.9, "box": (10, 10, 40, 40), "train_crop": np.zeros((40, 40), np.uint8)},
     ]
     monkeypatch.setattr(app, "annotate_frame", lambda f, smoothed_preds=None, alpha=0.7: (f, {}, smoothed_preds, faces))
     _, _, _, state, _ = app.process_booth_frame(frame, app.init_booth_state())
@@ -397,10 +517,10 @@ def test_live_stream_carries_ema_state(monkeypatch):
     assert abs(confs2["Angry"] - 0.70) < 1e-6
     assert abs(confs2["Happy"] - 0.30) < 1e-6
 
-    # No face -> smoother resets
+    # A detection dropout keeps the smoother (so the next frame is not a raw, unsmoothed spike)
     monkeypatch.setattr(app, "face_cascade", type("NoFace", (), {"detectMultiScale": lambda self, *a, **k: []})())
     _, confs3, ema3 = app.process_live_frame(frame, ema2)
-    assert confs3 == {} and ema3 is None
+    assert confs3 == {} and np.array_equal(ema3, ema2)
 
 
 def test_dynamic_peak_expression_tracking(monkeypatch):
@@ -409,6 +529,8 @@ def test_dynamic_peak_expression_tracking(monkeypatch):
     frame = np.full((120, 120, 3), 128, dtype=np.uint8)
 
     def mock(faces):
+        for face in faces:
+            face.setdefault("train_crop", np.zeros((50, 50), np.uint8))
         return lambda f, smoothed_preds=None, alpha=0.7: (f, {}, smoothed_preds, faces)
 
     monkeypatch.setattr(app, "annotate_frame", mock([{"label": "Surprise", "score": 0.20, "box": (10, 10, 50, 50)}]))
@@ -437,9 +559,17 @@ def test_generate_photo_strip_returns_pil_image():
     state = app.init_booth_state()
     state["Happy"]["crop"] = np.full((100, 100, 3), 200, dtype=np.uint8)
     state["Happy"]["score"] = 0.95
+    state, _, _ = app.use_sample_face("Disgust", state)
     strip = app.generate_photo_strip(state)
     assert isinstance(strip, Image.Image)
     assert strip.width > 0 and strip.height > 0
+    assert app.slot_caption("Disgust", state["Disgust"]) == "Disgust (Sample)"
+    assert app.slot_caption("Happy", state["Happy"]) == "Happy: 95%"
+
+
+def test_gradio_cache_is_purged():
+    """Gradio keeps its own copies of uploads/outputs; they must be on a purge schedule too."""
+    assert app.demo.delete_cache == app.GRADIO_CACHE_TTL
 
 
 def test_reset_booth_clears_ema():
@@ -508,6 +638,30 @@ def test_explain_samples_fallback(tmp_path):
 class _LM:
     def __init__(self, x, y):
         self.x, self.y = x, y
+
+
+def test_face_landmarker_constructs_and_measures_ear_on_real_face():
+    """
+    REGRESSION TEST: mediapipe>=1.0 removed mp.solutions; monitor.py must run on the pinned
+    version. Builds the Tasks-API landmarker, runs it on a real (upscaled) face and a blank
+    frame, and checks the EAR of the open-eyed sample is above the drowsiness threshold.
+    """
+    landmarker = monitor.create_landmarker()
+    try:
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        assert monitor.detect_landmarks(landmarker, blank, 0) == []
+
+        face = cv2.cvtColor(cv2.resize(cv2.imread("assets/samples/neutral.jpg"), (256, 256),
+                                       interpolation=cv2.INTER_CUBIC), cv2.COLOR_BGR2RGB)
+        canvas = np.full((480, 640, 3), 128, dtype=np.uint8)
+        canvas[112:368, 192:448] = face
+        faces = monitor.detect_landmarks(landmarker, canvas, 33)
+        assert len(faces) == 1
+        assert len(faces[0]) >= 468
+        ear = monitor.average_ear(faces[0], 640, 480)
+        assert monitor.EAR_THRESHOLD < ear < 0.6
+    finally:
+        landmarker.close()
 
 
 def test_eye_aspect_ratio_open_vs_closed():

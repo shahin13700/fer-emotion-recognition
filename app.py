@@ -42,6 +42,8 @@ MAX_VIDEO_FRAMES = int(os.environ.get("EDGEVISION_MAX_VIDEO_FRAMES", "1800"))
 MAX_UPLOAD_SIZE = os.environ.get("EDGEVISION_MAX_UPLOAD", "50mb")
 VIDEO_OUT_DIR = os.path.join(tempfile.gettempdir(), "edgevision_videos")
 VIDEO_OUT_TTL_SECONDS = 3600
+# Gradio keeps its own copy of every uploaded and returned file; purge those on the same schedule.
+GRADIO_CACHE_TTL = (VIDEO_OUT_TTL_SECONDS, VIDEO_OUT_TTL_SECONDS)
 
 if not os.path.exists(INDICES_PATH):
     raise FileNotFoundError(f"Missing {INDICES_PATH}. Please train or copy outputs first.")
@@ -120,16 +122,42 @@ face_cascade = cv2.CascadeClassifier(cascade_path)
 # -------------------------------------------------------------
 # 2. State & Processing Helpers
 # -------------------------------------------------------------
+def empty_slot():
+    return {
+        "score": 0.0,
+        "crop": None,           # Padded RGB crop for display (gallery / photo strip)
+        "train_crop": None,     # Tight Haar-box grayscale crop: exactly what the model classified
+        "is_sample": False,     # Benchmark fallback face rather than a live capture
+        "label_source": None,   # "model_argmax" or "user_corrected"
+        "saved": False,         # Already written to the local dataset (prevents duplicate saves)
+    }
+
+
 def init_booth_state():
     """Initializes empty session dictionary for the 7 emotion slots."""
-    return {
-        emotion: {
-            "score": 0.0,
-            "crop": None,       # RGB numpy array
-            "is_sample": False  # Distinguishes live webcam capture from benchmark fallback
-        }
-        for emotion in emotion_labels
-    }
+    return {emotion: empty_slot() for emotion in emotion_labels}
+
+
+def slot_caption(emotion, slot):
+    """Gallery / strip caption. Sample faces carry no number: the model does not necessarily
+    predict that emotion for them, so printing the reference score would read as a prediction."""
+    if slot.get("is_sample"):
+        return f"{emotion} (Sample)"
+    fixed = " (relabelled)" if slot.get("label_source") == "user_corrected" else ""
+    return f"{emotion}: {slot['score']*100:.0f}%{fixed}"
+
+
+def gallery_items_from_state(booth_state):
+    return [(booth_state[e]["crop"], slot_caption(e, booth_state[e]))
+            for e in emotion_labels if booth_state[e]["crop"] is not None]
+
+
+def challenge_status(booth_state):
+    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR]
+    missing = [e for e in emotion_labels if booth_state[e]["score"] < MIN_CAPTURE_FLOOR]
+    if not missing:
+        return "🎉 **CHALLENGE COMPLETE!** You unlocked all 7 emotions! Click **Generate Photo Strip** below!"
+    return f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Next up: **{', '.join(missing)}** — make your best face!)*"
 
 
 def get_local_dataset_stats():
@@ -220,7 +248,9 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
 
     confidences = {}
     if len(faces) == 0:
-        return annotated, confidences, None, []
+        # Keep the smoother through detection dropouts (a raw, unsmoothed frame right after a
+        # miss is exactly the spike EMA exists to suppress). Callers reset it explicitly.
+        return annotated, confidences, smoothed_preds, []
 
     # Sort detected faces by area descending so primary face is index 0
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
@@ -230,8 +260,8 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         box_color = (0, 230, 255) # High-visibility Cyan
         cv2.rectangle(annotated, (x, y), (x + fw, y + fh), box_color, 3)
 
-        roi_gray = gray[y:y+fh, x:x+fw]
-        roi_gray = cv2.resize(roi_gray, (48, 48), interpolation=cv2.INTER_AREA)
+        roi_gray_full = gray[y:y+fh, x:x+fw]
+        roi_gray = cv2.resize(roi_gray_full, (48, 48), interpolation=cv2.INTER_AREA)
         roi = roi_gray.astype('float32') / 255.0
         roi = np.expand_dims(np.expand_dims(roi, axis=0), axis=-1)
 
@@ -275,7 +305,8 @@ def annotate_frame(frame_bgr, smoothed_preds=None, alpha=0.70):
         detected_faces_info.append({
             "box": (x, y, fw, fh),
             "label": top_label,
-            "score": top_conf
+            "score": top_conf,
+            "train_crop": roi_gray_full.copy()   # what the model actually saw, before the 48x48 resize
         })
 
     return annotated, confidences, smoothed_preds, detected_faces_info
@@ -314,8 +345,9 @@ def process_booth_frame(frame, booth_state, ema_state=None):
         score = info["score"]
 
         # Dynamic Peak Expression Tracker: record & upgrade whenever score exceeds noise floor
-        # and beats your previous personal best for this emotion!
-        if score >= MIN_CAPTURE_FLOOR and score > booth_state[label]["score"]:
+        # and beats your previous personal best. A benchmark sample never blocks a live capture.
+        slot = booth_state[label]
+        if score >= MIN_CAPTURE_FLOOR and (score > slot["score"] or slot["is_sample"]):
             x, y, fw, fh = info["box"]
             pad_x = int(fw * 0.25)
             pad_y = int(fh * 0.25)
@@ -328,29 +360,16 @@ def process_booth_frame(frame, booth_state, ema_state=None):
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
 
             booth_state[label] = {
+                **empty_slot(),
                 "score": float(score),
                 "crop": crop_rgb,
-                "is_sample": False
+                "train_crop": info.get("train_crop"),
+                "label_source": "model_argmax",
             }
             new_capture = True
 
-    # Challenge counter text based on captured slots
-    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR]
-    missing = [e for e in emotion_labels if booth_state[e]["score"] < MIN_CAPTURE_FLOOR]
-
-    if len(missing) == 0:
-        status_text = "🎉 **CHALLENGE COMPLETE!** You unlocked all 7 emotions! Click **Generate Photo Strip** below!"
-    else:
-        missing_str = ", ".join(missing)
-        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Next up: **{missing_str}** — make your best face!)*"
-
-    # Format gallery items
-    gallery_items = []
-    for e in emotion_labels:
-        if booth_state[e]["crop"] is not None:
-            tag = " (Sample)" if booth_state[e].get("is_sample") else ""
-            gallery_items.append((booth_state[e]["crop"], f"{e}: {booth_state[e]['score']*100:.0f}%{tag}"))
-
+    status_text = challenge_status(booth_state)
+    gallery_items = gallery_items_from_state(booth_state)
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
     if new_capture:
@@ -373,29 +392,31 @@ def use_sample_face(emotion, booth_state):
         # Smoothly upscale to standard portrait dimensions so it renders cleanly
         img_bgr = cv2.resize(img_bgr, (240, 240), interpolation=cv2.INTER_CUBIC)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        gate = EMPIRICAL_THRESHOLDS.get(emotion, 0.40)
-        booth_state[emotion] = {
-            "score": float(gate),
-            "crop": img_rgb,
-            "is_sample": True
-        }
+        # The slot counts as unlocked (score at the floor) but displays no number: the model
+        # does not necessarily predict this emotion for the sample face.
+        booth_state[emotion] = {**empty_slot(), "score": float(MIN_CAPTURE_FLOOR), "crop": img_rgb, "is_sample": True}
 
-    unlocked = [e for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR]
-    missing = [e for e in emotion_labels if booth_state[e]["score"] < MIN_CAPTURE_FLOOR]
+    return booth_state, challenge_status(booth_state), gallery_items_from_state(booth_state)
 
-    if len(missing) == 0:
-        status_text = "🎉 **CHALLENGE COMPLETE!** All 7 emotions filled! Click **Generate Photo Strip** below!"
-    else:
-        missing_str = ", ".join(missing)
-        status_text = f"🎯 **Challenge:** {len(unlocked)} / 7 Emotions Captured! *(Missing: **{missing_str}**)*"
 
-    gallery_items = []
-    for e in emotion_labels:
-        if booth_state[e]["crop"] is not None:
-            tag = " (Sample)" if booth_state[e].get("is_sample") else ""
-            gallery_items.append((booth_state[e]["crop"], f"{e}: {booth_state[e]['score']*100:.0f}%{tag}"))
-
-    return booth_state, status_text, gallery_items
+def relabel_slot(booth_state, from_emotion, to_emotion):
+    """
+    Lets the user correct the model's label for a captured face. Without this the local
+    dataset is pure self-training on the model's own argmax; with it, saved records carry
+    label_source="user_corrected". The corrected face moves to the target slot (overwriting
+    whatever the model had put there) and the source slot is cleared.
+    """
+    if booth_state is None:
+        booth_state = init_booth_state()
+    if not from_emotion or not to_emotion or from_emotion == to_emotion:
+        return booth_state, gr.skip(), gr.skip(), "ℹ️ Pick a captured slot and a *different* correct emotion."
+    src = booth_state.get(from_emotion)
+    if src is None or src["crop"] is None or src["is_sample"]:
+        return booth_state, gr.skip(), gr.skip(), f"⚠️ **{from_emotion}** has no live capture to relabel."
+    booth_state[to_emotion] = {**src, "label_source": "user_corrected", "saved": False}
+    booth_state[from_emotion] = empty_slot()
+    msg = f"✏️ Moved the face captured as **{from_emotion}** into the **{to_emotion}** slot (label corrected by you)."
+    return booth_state, challenge_status(booth_state), gallery_items_from_state(booth_state), msg
 
 
 def save_and_contribute(booth_state, consent_given):
@@ -414,43 +435,75 @@ def save_and_contribute(booth_state, consent_given):
         return "⚠️ No expressions captured yet in this session.", gr.skip()
 
     saved_count = 0
+    already_saved = 0
     os.makedirs(USER_CONTRIB_DIR, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for emotion, data in booth_state.items():
         # Only save real captured faces (exclude benchmark fallback samples)
-        if data["crop"] is not None and not data.get("is_sample") and data["score"] >= MIN_CAPTURE_FLOOR:
-            emo_dir = os.path.join(USER_CONTRIB_DIR, emotion.lower())
-            os.makedirs(emo_dir, exist_ok=True)
+        if data["crop"] is None or data.get("is_sample") or data["score"] < MIN_CAPTURE_FLOOR:
+            continue
+        # Each capture is written once. Clicking Save again must not duplicate it, otherwise the
+        # fine-tune volume gate and its held-out split can be satisfied with copies of one face.
+        if data.get("saved"):
+            already_saved += 1
+            continue
 
-            img_filename = f"{timestamp}_{emotion.lower()}_{saved_count}.png"
-            img_path = os.path.join(emo_dir, img_filename)
+        emo_dir = os.path.join(USER_CONTRIB_DIR, emotion.lower())
+        os.makedirs(emo_dir, exist_ok=True)
 
-            crop_pil = Image.fromarray(data["crop"])
-            crop_pil.save(img_path)
+        img_filename = f"{timestamp}_{emotion.lower()}_{saved_count}.png"
+        img_path = os.path.join(emo_dir, img_filename)
 
-            log_entry = {
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "emotion": emotion.lower(),
-                "score": round(float(data["score"]), 4),
-                "image_path": img_path.replace("\\", "/"),
-                "verified_by_user": True
-            }
+        # Train on the tight grayscale box the model actually classified, not the padded
+        # display crop; otherwise fine-tuning learns the padding instead of the face.
+        train_crop = data.get("train_crop")
+        if train_crop is None:
+            train_crop = cv2.cvtColor(data["crop"], cv2.COLOR_RGB2GRAY)
+        Image.fromarray(train_crop).save(img_path)
 
-            with open(METADATA_JSONL, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
+        log_entry = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "emotion": emotion.lower(),
+            "score": round(float(data["score"]), 4),
+            "image_path": img_path.replace("\\", "/"),
+            "label_source": data.get("label_source") or "model_argmax",
+            "consent_given": True
+        }
 
-            saved_count += 1
+        with open(METADATA_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+
+        data["saved"] = True
+        saved_count += 1
 
     _, _, updated_banner = get_local_dataset_stats()
 
     if saved_count > 0:
-        feedback = f"✅ Successfully saved **{saved_count}** expression(s) locally to `dataset/user_contributed/`! Ready for fine-tuning."
+        feedback = f"✅ Saved **{saved_count}** new expression(s) locally to `dataset/user_contributed/`."
+        if already_saved:
+            feedback += f" ({already_saved} already saved earlier in this session were skipped.)"
+    elif already_saved:
+        feedback = "ℹ️ Everything captured in this session is already saved; capture new expressions to add more."
     else:
         feedback = "ℹ️ No new live facial expressions were ready to save (benchmark samples are excluded from fine-tuning)."
 
     return feedback, updated_banner
 
+
+
+def _load_font(size):
+    """A real TrueType font where one is available; PIL's bitmap default is 11 px."""
+    candidates = [
+        "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "arial.ttf", "C:/Windows/Fonts/arial.ttf", "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def generate_photo_strip(booth_state):
@@ -460,6 +513,10 @@ def generate_photo_strip(booth_state):
     """
     if booth_state is None:
         booth_state = init_booth_state()
+
+    font_title = _load_font(22)
+    font_body = _load_font(15)
+    font_small = _load_font(13)
 
     tile_w, tile_h = 280, 280
     pad = 16
@@ -471,10 +528,10 @@ def generate_photo_strip(booth_state):
     draw = ImageDraw.Draw(canvas)
 
     # Header
-    draw.text((pad + 10, 18), "EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255))
+    draw.text((pad + 10, 14), "EDGEVISION EMOTION PHOTO BOOTH", fill=(0, 230, 255), font=font_title)
     date_str = datetime.datetime.now().strftime("%B %d, %Y - %H:%M")
     unlocked_count = sum(1 for e in emotion_labels if booth_state[e]["score"] >= MIN_CAPTURE_FLOOR)
-    draw.text((pad + 10, 44), f"Session Highlights | Score: {unlocked_count}/7 Emotions Unlocked | {date_str}", fill=(180, 180, 180))
+    draw.text((pad + 10, 46), f"Session Highlights | Score: {unlocked_count}/7 Emotions Unlocked | {date_str}", fill=(180, 180, 180), font=font_body)
 
     # Render 7 Emotion Tiles + 1 Summary Tile in a 4x2 grid
     positions = [
@@ -501,25 +558,23 @@ def generate_photo_strip(booth_state):
             # Bottom Badge
             badge_color = EMOTION_COLORS_RGB.get(emotion, (0, 230, 255))
             draw.rectangle([tx, ty + tile_h - 36, tx + tile_w, ty + tile_h], fill=badge_color)
-            sample_tag = " (SAMPLE)" if slot.get("is_sample") else ""
-            label_caption = f"{emotion.upper()}: {slot['score']*100:.0f}%{sample_tag}"
-            draw.text((tx + 12, ty + tile_h - 26), label_caption, fill=(255, 255, 255))
+            draw.text((tx + 12, ty + tile_h - 28), slot_caption(emotion, slot).upper(), fill=(255, 255, 255), font=font_body)
         else:
             # Locked slot placeholder
-            draw.text((tx + 30, ty + tile_h // 2 - 20), f"[LOCKED] {emotion.upper()}", fill=(120, 130, 145))
-            draw.text((tx + 30, ty + tile_h // 2 + 6), "Not captured yet", fill=(80, 90, 105))
+            draw.text((tx + 30, ty + tile_h // 2 - 20), f"[LOCKED] {emotion.upper()}", fill=(120, 130, 145), font=font_body)
+            draw.text((tx + 30, ty + tile_h // 2 + 6), "Not captured yet", fill=(80, 90, 105), font=font_small)
 
     # Slot 8: Summary / Signature Card
     scol, srow = positions[7]
     stx = pad + scol * (tile_w + pad)
     sty = header_h + pad + srow * (tile_h + pad)
     draw.rectangle([stx, sty, stx + tile_w, sty + tile_h], fill=(25, 32, 42), outline=(0, 230, 255), width=2)
-    draw.text((stx + 20, sty + 40), "EDGEVISION AI", fill=(0, 230, 255))
-    draw.text((stx + 20, sty + 80), f"Result: {unlocked_count} of 7", fill=(255, 255, 255))
+    draw.text((stx + 20, sty + 36), "EDGEVISION AI", fill=(0, 230, 255), font=font_title)
+    draw.text((stx + 20, sty + 82), f"Result: {unlocked_count} of 7", fill=(255, 255, 255), font=font_body)
     grade = "PERFECT!" if unlocked_count == 7 else "EXPRESSIVE!" if unlocked_count >= 5 else "NICE TRY!"
-    draw.text((stx + 20, sty + 115), f"Grade: {grade}", fill=(46, 204, 113))
-    draw.text((stx + 20, sty + 170), "MiniXception 51k params / 817 KB", fill=(150, 150, 150))
-    draw.text((stx + 20, sty + 195), "Real-Time CPU Inference", fill=(100, 100, 100))
+    draw.text((stx + 20, sty + 112), f"Grade: {grade}", fill=(46, 204, 113), font=font_body)
+    draw.text((stx + 20, sty + 176), "MiniXception 51k params / 817 KB", fill=(150, 150, 150), font=font_small)
+    draw.text((stx + 20, sty + 200), "Real-Time CPU Inference", fill=(100, 100, 100), font=font_small)
 
     return canvas
 
@@ -718,7 +773,7 @@ custom_css = """
 }
 """
 
-with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as demo:
+with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition", delete_cache=GRADIO_CACHE_TTL) as demo:
     booth_state = gr.State(value=init_booth_state)
     booth_ema = gr.State(value=None)
     live_ema = gr.State(value=None)
@@ -761,6 +816,15 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                         disgust_sample_btn = gr.Button("🤢 Fill Disgust (Benchmark Face)", variant="secondary", size="sm")
                         fear_sample_btn = gr.Button("😱 Fill Fear (Benchmark Face)", variant="secondary", size="sm")
 
+                    # Label correction: without it the saved dataset is pure self-training on the model's argmax
+                    with gr.Accordion("✏️ Wrong label? Relabel a captured face", open=False):
+                        gr.Markdown("Slots are labelled by the model's own top prediction. If it captured your *fear* face as *surprise*, move it here before saving.")
+                        with gr.Row():
+                            relabel_from = gr.Dropdown(choices=emotion_labels, label="Captured as", value=None)
+                            relabel_to = gr.Dropdown(choices=emotion_labels, label="Actually", value=None)
+                            relabel_btn = gr.Button("Move", size="sm")
+                        relabel_feedback = gr.Markdown("")
+
                     # Helpful Emoji Tips Accordion
                     with gr.Accordion("🎭 Facial Action Unit (AU) Guide & Tips", open=False):
                         gr.Markdown(
@@ -788,6 +852,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                         gr.Markdown(
                             "🔒 **Privacy:** face crops are written to `dataset/user_contributed/` on the machine running this app "
                             "and never uploaded anywhere by EdgeVision. Delete that folder to erase them. "
+                            "Labels are the model's own predictions unless you relabel them above; each capture is saved once. "
                             + ("" if ALLOW_LOCAL_SAVE else "**Saving is disabled on this shared deployment.**")
                         )
                         consent_box = gr.Checkbox(
@@ -816,6 +881,12 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                 fn=lambda s: use_sample_face("Fear", s),
                 inputs=[booth_state],
                 outputs=[booth_state, challenge_badge, gallery_output]
+            )
+
+            relabel_btn.click(
+                fn=relabel_slot,
+                inputs=[booth_state, relabel_from, relabel_to],
+                outputs=[booth_state, challenge_badge, gallery_output, relabel_feedback]
             )
 
             generate_strip_btn.click(
@@ -898,7 +969,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
         - **Model:** MiniXception with Depthwise Separable Convolutions & Residual Connections
         - **Parameters:** 51,255 (817 KB model file) · 57.3% accuracy on the FER2013 test set
         - **Inference:** ~2 ms per face on a desktop CPU (graph-compiled), plus Haar face detection
-        - **Active Learning:** Local, opt-in personal dataset with append-only JSONL logging
+        - **Active Learning:** Local, opt-in personal dataset (model-labelled unless you relabel) with append-only JSONL logging
         - **Repository:** [github.com/shahin13700/fer-emotion-recognition](https://github.com/shahin13700/fer-emotion-recognition)
         """
     )

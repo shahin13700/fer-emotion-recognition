@@ -1,12 +1,16 @@
 """
 Edge-Vision: Real-Time Facial Emotion & Driver Drowsiness Guard
-Combines Google MediaPipe Face Mesh (468 landmarks) with MiniXception CNN.
+Combines the MediaPipe Face Landmarker (Tasks API, 478 landmarks) with the MiniXception CNN.
 Tracks 7 emotion categories and computes Eye Aspect Ratio (EAR) to detect driver fatigue.
+
+The landmark model (face_landmarker.task, ~3.7 MB, Apache-2.0, published by Google) is not
+bundled; it is downloaded to model/ on first run or read from EDGEVISION_LANDMARKER_PATH.
 """
 
 import os
 import json
 import time
+import urllib.request
 import warnings
 warnings.filterwarnings('ignore')
 import cv2
@@ -14,26 +18,65 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# MediaPipe
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 # -------------------------------------------------------------
-# 1. MediaPipe Landmark Constants for Eye Aspect Ratio (EAR)
+# 1. Landmark Constants for Eye Aspect Ratio (EAR)
 # -------------------------------------------------------------
-# Left eye landmark indices (MediaPipe 468 mesh)
+# Eye landmark indices (MediaPipe face mesh topology; unchanged in the Tasks API)
 LEFT_EYE_POINTS = [33, 160, 158, 133, 153, 144]
-# Right eye landmark indices
 RIGHT_EYE_POINTS = [362, 385, 387, 263, 373, 380]
 
 # EAR Thresholds
 EAR_THRESHOLD = 0.21         # Eye is considered closed below this ratio
-DROWSY_CONSEC_FRAMES = 15    # Number of consecutive frames eyes must be closed to sound alert (~0.5s)
+DROWSY_CONSEC_FRAMES = 15    # Consecutive closed-eye frames before alerting (~0.5 s at 30 fps)
+EMA_RESET_AFTER_MISSES = 30  # Frames without a face before the emotion smoother is reset (~1 s)
+
+LANDMARKER_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+                  "face_landmarker/float16/1/face_landmarker.task")
+LANDMARKER_PATH = os.environ.get("EDGEVISION_LANDMARKER_PATH", os.path.join("model", "face_landmarker.task"))
+
+
+def ensure_landmarker_model(path=LANDMARKER_PATH, url=LANDMARKER_URL):
+    """Returns the path to face_landmarker.task, downloading it once if it is missing."""
+    if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    print(f"Downloading MediaPipe Face Landmarker model (~3.7 MB) to {path} ...")
+    tmp = path + ".part"
+    urllib.request.urlretrieve(url, tmp)
+    os.replace(tmp, path)
+    return path
+
+
+def create_landmarker(path=None, running_mode=mp_vision.RunningMode.VIDEO, num_faces=1):
+    """Builds a MediaPipe FaceLandmarker (Tasks API replacement for the removed mp.solutions.face_mesh)."""
+    path = ensure_landmarker_model(path or LANDMARKER_PATH)
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=path),
+        running_mode=running_mode,
+        num_faces=num_faces,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.FaceLandmarker.create_from_options(options)
+
+
+def detect_landmarks(landmarker, rgb_frame, timestamp_ms):
+    """Runs the landmarker on an RGB frame; returns the list of landmark lists (one per face)."""
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_frame))
+    result = landmarker.detect_for_video(mp_image, int(timestamp_ms))
+    return result.face_landmarks
 
 
 def calculate_ear(landmarks, eye_indices, img_w, img_h):
     """
     Computes Eye Aspect Ratio (EAR) for a given eye using 6 facial landmarks.
     EAR = (|p2 - p6| + |p3 - p5|) / (2 * |p1 - p4|)
+    `landmarks` is any sequence of objects with normalized .x / .y attributes.
     """
     pts = [np.array([landmarks[idx].x * img_w, landmarks[idx].y * img_h]) for idx in eye_indices]
 
@@ -49,10 +92,17 @@ def calculate_ear(landmarks, eye_indices, img_w, img_h):
     return ear
 
 
+def average_ear(landmarks, img_w, img_h):
+    """Mean EAR over both eyes for one face."""
+    left = calculate_ear(landmarks, LEFT_EYE_POINTS, img_w, img_h)
+    right = calculate_ear(landmarks, RIGHT_EYE_POINTS, img_w, img_h)
+    return (left + right) / 2.0
+
+
 def main():
     print("===============================================================")
     print("  EdgeVision: Real-Time Emotion & Drowsiness Guard")
-    print("  Powered by MediaPipe Face Mesh + MiniXception")
+    print("  Powered by MediaPipe Face Landmarker + MiniXception")
     print("===============================================================")
 
     # 1. Load Emotion Model & Labels
@@ -78,21 +128,14 @@ def main():
 
     _ = infer(tf.zeros((1, 48, 48, 1)))  # Warmup / trace
 
-    # 2. Initialize MediaPipe Face Mesh
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-    mp_drawing = mp.solutions.drawing_utils
-    drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1, color=(0, 255, 128))
+    # 2. Initialize MediaPipe Face Landmarker
+    landmarker = create_landmarker()
 
     # 3. Setup Webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Could not access webcam.")
+        landmarker.close()
         return
 
     print("\n[ACTIVE] Webcam initialized. Press 'Q' to quit anytime.")
@@ -100,8 +143,10 @@ def main():
     # State variables
     drowsy_counter = 0
     smoothed_preds = None
+    missed_frames = 0
     alpha = 0.65  # EMA smoothing factor
     prev_time = time.time()
+    start_time = prev_time
 
     while True:
         ret, frame = cap.read()
@@ -117,19 +162,17 @@ def main():
         fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 30.0
         prev_time = curr_time
 
-        # MediaPipe Mesh Inference
-        results = face_mesh.process(rgb_frame)
+        # Landmark inference (VIDEO mode needs monotonically increasing timestamps)
+        faces = detect_landmarks(landmarker, rgb_frame, (curr_time - start_time) * 1000.0)
+        avg_ear = None
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                landmarks = face_landmarks.landmark
-
+        if faces:
+            missed_frames = 0
+            for landmarks in faces:
                 # -----------------------------------------------------
                 # A. Eye Aspect Ratio & Drowsiness Tracking
                 # -----------------------------------------------------
-                left_ear = calculate_ear(landmarks, LEFT_EYE_POINTS, w, h)
-                right_ear = calculate_ear(landmarks, RIGHT_EYE_POINTS, w, h)
-                avg_ear = (left_ear + right_ear) / 2.0
+                avg_ear = average_ear(landmarks, w, h)
 
                 is_drowsy = False
                 if avg_ear < EAR_THRESHOLD:
@@ -145,7 +188,6 @@ def main():
                 x_coords = [int(lm.x * w) for lm in landmarks]
                 y_coords = [int(lm.y * h) for lm in landmarks]
 
-                # Bounding box with padding
                 xmin, xmax = max(0, min(x_coords)), min(w, max(x_coords))
                 ymin, ymax = max(0, min(y_coords)), min(h, max(y_coords))
 
@@ -175,11 +217,9 @@ def main():
                     box_color = (0, 0, 255) if is_drowsy else (0, 220, 100)
                     cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), box_color, 2)
 
-                    # Draw Top Emotion Tag
                     tag = f"{top_emotion} ({top_conf:.0f}%)"
                     cv2.putText(frame, tag, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2, cv2.LINE_AA)
 
-                    # Draw Emotion Probability Bars
                     bar_x = xmax + 10
                     if bar_x + 160 < w:
                         cv2.rectangle(frame, (bar_x - 5, ymin - 10), (bar_x + 165, ymin + 150), (15, 15, 15), -1)
@@ -197,11 +237,15 @@ def main():
                     cv2.putText(frame, "CRITICAL ALERT: DROWSINESS DETECTED!", (int(w * 0.1), 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
         else:
-            smoothed_preds = None
+            # Keep the smoother through brief detection dropouts; a single missed frame followed
+            # by a raw, unsmoothed prediction is exactly the spike EMA exists to suppress.
+            missed_frames += 1
+            if missed_frames >= EMA_RESET_AFTER_MISSES:
+                smoothed_preds = None
 
         # Top HUD: EAR & FPS
         cv2.putText(frame, f"FPS: {fps:.1f}", (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-        if results.multi_face_landmarks:
+        if avg_ear is not None:
             cv2.putText(frame, f"Eye Aspect Ratio (EAR): {avg_ear:.2f}", (w - 280, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
@@ -210,7 +254,9 @@ def main():
             break
 
     cap.release()
+    landmarker.close()
     cv2.destroyAllWindows()
+
 
 if __name__ == '__main__':
     main()

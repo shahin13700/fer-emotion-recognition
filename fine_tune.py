@@ -5,8 +5,14 @@ Enforces 4 guardrails:
 2. Blended Data Generator (mixes a fixed share of user data into every batch)
 3. Augmentation Pipeline (rotation, flip, zoom, brightness) applied to raw 0-255 pixels
 4. Before/After evaluation on BOTH a held-out slice of the user's own faces and the
-   FER2013 test set; promotion requires no user-holdout regression and a bounded
-   FER2013 regression. The previous production weights are always backed up.
+   FER2013 test set; promotion requires no user-holdout regression, a bounded overall
+   and macro-F1 regression on FER2013, and no single class losing more than
+   --max_class_drop recall (guards against the majority-class drift that an
+   unweighted fine-tune produces). The previous production weights are always backed up.
+
+Honesty note: using the FER2013 test set as a promotion guard is a mild form of model
+selection on the test set. For a personal model that is acceptable; do not quote the
+post-fine-tune test accuracy as a benchmark result.
 
 Requires the FER2013 dataset unpacked at dataset/train and dataset/test
 (see README "Retraining Base Model from Scratch" for the download command).
@@ -25,13 +31,16 @@ if hasattr(sys.stdout, 'reconfigure'):
 import json
 import argparse
 import datetime
+import hashlib
 import shutil
+import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score, recall_score
+from sklearn.utils.class_weight import compute_class_weight
 
 USER_CONTRIB_DIR = 'dataset/user_contributed'
 METADATA_JSONL = os.path.join(USER_CONTRIB_DIR, 'metadata.jsonl')
@@ -45,8 +54,32 @@ REPORT_PATH = 'outputs/fine_tune_report.json'
 INDICES_PATH = 'outputs/class_indices.json'
 
 MIN_SAMPLES_PER_CLASS = 10
-USER_HOLDOUT_FRACTION = 0.2   # Share of user faces held out to measure personal adaptation
-MAX_TEST_DROP_DEFAULT = 0.01  # Allowed FER2013 test accuracy regression (1.0 percentage point)
+USER_HOLDOUT_FRACTION = 0.2    # Share of user faces held out to measure personal adaptation
+MAX_TEST_DROP_DEFAULT = 0.01   # Allowed FER2013 accuracy / macro-F1 regression (1.0 percentage point)
+MAX_CLASS_DROP_DEFAULT = 0.03  # Allowed per-class recall regression on FER2013 (3 percentage points)
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
+
+
+def list_unique_user_images(emo_folder):
+    """
+    Image paths in a class folder with byte-identical duplicates removed. Saving the same
+    booth capture twice (or copying files) must not count twice toward the volume gate,
+    and must never place a copy of a training image into the held-out split.
+    """
+    seen, unique = set(), []
+    if not os.path.isdir(emo_folder):
+        return unique
+    for fname in sorted(os.listdir(emo_folder)):
+        if not fname.lower().endswith(IMAGE_EXTS):
+            continue
+        fpath = os.path.join(emo_folder, fname)
+        with open(fpath, 'rb') as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        unique.append(fpath)
+    return unique
 
 
 def check_dataset_dirs():
@@ -83,16 +116,21 @@ def check_guardrails(force=False):
     emotions = list(class_indices.keys())
     counts = {emo: 0 for emo in emotions}
 
+    duplicates = 0
     if os.path.exists(USER_CONTRIB_DIR):
         for emo in emotions:
             emo_folder = os.path.join(USER_CONTRIB_DIR, emo)
             if os.path.isdir(emo_folder):
-                valid_files = [f for f in os.listdir(emo_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                counts[emo] = len(valid_files)
+                all_files = [f for f in os.listdir(emo_folder) if f.lower().endswith(IMAGE_EXTS)]
+                unique_files = list_unique_user_images(emo_folder)
+                counts[emo] = len(unique_files)
+                duplicates += len(all_files) - len(unique_files)
 
     print("\n" + "=" * 60)
-    print("[GUARDRAIL 1] LOCAL USER DATA VOLUME AUDIT")
+    print("[GUARDRAIL 1] LOCAL USER DATA VOLUME AUDIT (unique images)")
     print("=" * 60)
+    if duplicates:
+        print(f"Ignoring {duplicates} byte-identical duplicate file(s).")
     print(f"{'Emotion':<15} | {'Collected':<12} | {'Requirement':<12} | {'Status'}")
     print("-" * 60)
 
@@ -143,6 +181,38 @@ def evaluate_model_on_test(model_instance, class_labels):
     return float(acc), y_true, y_pred
 
 
+def test_metrics(y_true, y_pred, num_classes):
+    """Accuracy, macro-F1 and per-class recall: the promotion gate looks at all three."""
+    labels = list(range(num_classes))
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average='macro', zero_division=0)),
+        "recall": [float(r) for r in recall_score(y_true, y_pred, labels=labels, average=None, zero_division=0)],
+    }
+
+
+def promotion_decision(base, new, base_user_acc, new_user_acc, class_labels,
+                       max_test_drop=MAX_TEST_DROP_DEFAULT, max_class_drop=MAX_CLASS_DROP_DEFAULT):
+    """
+    Returns (promote, reasons). The candidate must not get worse on the user's held-out
+    faces, may lose at most max_test_drop in FER2013 accuracy and macro-F1, and no class
+    may lose more than max_class_drop recall.
+    """
+    reasons = []
+    acc_delta = new["accuracy"] - base["accuracy"]
+    f1_delta = new["macro_f1"] - base["macro_f1"]
+    if acc_delta < -max_test_drop:
+        reasons.append(f"FER2013 accuracy dropped {abs(acc_delta)*100:.2f} pp (limit {max_test_drop*100:.2f} pp)")
+    if f1_delta < -max_test_drop:
+        reasons.append(f"FER2013 macro-F1 dropped {abs(f1_delta)*100:.2f} pp (limit {max_test_drop*100:.2f} pp)")
+    for label, r_base, r_new in zip(class_labels, base["recall"], new["recall"]):
+        if r_new - r_base < -max_class_drop:
+            reasons.append(f"{label} recall dropped {(r_base - r_new)*100:.1f} pp (limit {max_class_drop*100:.1f} pp)")
+    if base_user_acc is not None and new_user_acc is not None and new_user_acc < base_user_acc:
+        reasons.append(f"accuracy on your held-out faces dropped {(base_user_acc - new_user_acc)*100:.2f} pp")
+    return len(reasons) == 0, reasons
+
+
 def load_and_preprocess_user_data(class_indices):
     """
     Loads user-contributed images as (48, 48, 1) float32 tensors in the RAW 0-255
@@ -162,20 +232,18 @@ def load_and_preprocess_user_data(class_indices):
         return np.empty((0, 48, 48, 1)), np.empty((0, num_classes))
 
     for emo, class_idx in class_indices.items():
-        emo_folder = os.path.join(USER_CONTRIB_DIR, emo)
-        if os.path.isdir(emo_folder):
-            for fname in os.listdir(emo_folder):
-                if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    fpath = os.path.join(emo_folder, fname)
-                    img = tf.keras.preprocessing.image.load_img(
-                        fpath, color_mode='grayscale', target_size=(48, 48)
-                    )
-                    arr = tf.keras.preprocessing.image.img_to_array(img)  # 0-255, rescaled by the generator
-                    one_hot = np.zeros(num_classes, dtype=np.float32)
-                    one_hot[class_idx] = 1.0
+        for fpath in list_unique_user_images(os.path.join(USER_CONTRIB_DIR, emo)):
+            # Same preprocessing as inference (app.py annotate_frame): grayscale + INTER_AREA.
+            # PIL's default nearest-neighbour resize would introduce train/serve skew.
+            gray = cv2.imread(fpath, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            arr = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA).astype(np.float32)[..., np.newaxis]
+            one_hot = np.zeros(num_classes, dtype=np.float32)
+            one_hot[class_idx] = 1.0
 
-                    x_user.append(arr)
-                    y_user.append(one_hot)
+            x_user.append(arr)
+            y_user.append(one_hot)
 
     if len(x_user) == 0:
         return np.empty((0, 48, 48, 1)), np.empty((0, num_classes))
@@ -223,16 +291,32 @@ def evaluate_on_user_holdout(model_instance, x_hold, y_hold):
     return float(accuracy_score(np.argmax(y_hold, axis=1), np.argmax(preds, axis=1)))
 
 
-def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_size=32, user_ratio=0.25):
+def sample_weights_for(y_batch, class_weight):
+    """Per-sample weights from a {class_index: weight} dict (Keras 3 rejects class_weight for generators)."""
+    idx = np.argmax(y_batch, axis=1)
+    return np.array([class_weight.get(int(i), 1.0) for i in idx], dtype=np.float32)
+
+
+def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_size=32, user_ratio=0.25,
+                             class_weight=None):
     """
     Guardrail 2: Blended Generator that injects augmented user data into every
     training batch alongside base FER2013 samples.
 
     x_user must be RAW 0-255 pixels (see load_and_preprocess_user_data); the user
     datagen rescales to [0, 1] after augmentation, matching the base pipeline.
+    With class_weight, batches are yielded as (x, y, sample_weight) so the fine-tune
+    keeps the class balancing the base model was trained with.
     """
     if len(x_user) == 0:
-        return base_gen
+        if class_weight is None:
+            return base_gen
+
+        def _weighted_base():
+            while True:
+                bx, by = next(base_gen)
+                yield bx, by, sample_weights_for(by, class_weight)
+        return _weighted_base()
 
     if user_datagen is None:
         user_datagen = build_user_datagen()
@@ -261,8 +345,12 @@ def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_
             # Shuffle combined batch
             indices = np.arange(len(merged_x))
             np.random.shuffle(indices)
+            merged_x, merged_y = merged_x[indices], merged_y[indices]
 
-            yield merged_x[indices], merged_y[indices]
+            if class_weight is None:
+                yield merged_x, merged_y
+            else:
+                yield merged_x, merged_y, sample_weights_for(merged_y, class_weight)
 
     return _generator()
 
@@ -275,7 +363,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for fine-tuning (default: 5e-5)")
     parser.add_argument("--max_test_drop", type=float, default=MAX_TEST_DROP_DEFAULT,
-                        help="Max allowed FER2013 test accuracy drop before rollback, as a fraction (default: 0.01)")
+                        help="Max allowed FER2013 accuracy / macro-F1 drop before rollback, as a fraction (default: 0.01)")
+    parser.add_argument("--max_class_drop", type=float, default=MAX_CLASS_DROP_DEFAULT,
+                        help="Max allowed per-class recall drop on FER2013, as a fraction (default: 0.03)")
     args = parser.parse_args()
 
     ensure_original_baseline()
@@ -316,8 +406,9 @@ def main():
     # Guardrail 4a: Evaluate Baseline Before Training
     # -------------------------------------------------------------
     print("\nEvaluating Baseline Model on Test Set (`dataset/test`)...")
-    base_acc, _, _ = evaluate_model_on_test(baseline_model, class_labels)
-    print(f"[METRIC] Baseline FER2013 Test Accuracy: {base_acc*100:.2f}%")
+    base_acc, y_true, y_pred = evaluate_model_on_test(baseline_model, class_labels)
+    base_metrics = test_metrics(y_true, y_pred, len(class_labels))
+    print(f"[METRIC] Baseline FER2013 Test Accuracy: {base_acc*100:.2f}%  (macro-F1 {base_metrics['macro_f1']*100:.2f}%)")
     base_user_acc = evaluate_on_user_holdout(baseline_model, x_user_hold, y_user_hold)
     if base_user_acc is not None:
         print(f"[METRIC] Baseline Accuracy on YOUR held-out faces: {base_user_acc*100:.2f}%")
@@ -342,16 +433,28 @@ def main():
         validation_split=0.15
     )
 
+    # When blending, the base generator yields exactly the base share of each batch so that
+    # no FER2013 samples are sliced off and silently discarded.
+    user_ratio = 0.25
+    blending = len(x_user_train) > 0
+    base_batch_size = max(1, args.batch_size - int(args.batch_size * user_ratio)) if blending else args.batch_size
+
     base_train_gen = train_datagen.flow_from_directory(
         BASE_TRAIN_DIR,
         target_size=(48, 48),
         color_mode='grayscale',
-        batch_size=args.batch_size,
+        batch_size=base_batch_size,
         class_mode='categorical',
         subset='training',
         seed=42,
         shuffle=True
     )
+
+    # Same class-balanced weights the base model was trained with; without them a fine-tune
+    # drifts toward Happy/Neutral and quietly loses Sad/Fear/Disgust recall.
+    base_classes = base_train_gen.classes
+    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(base_classes), y=base_classes)
+    class_weight_dict = {int(c): float(w) for c, w in zip(np.unique(base_classes), class_weights)}
 
     val_gen = val_datagen.flow_from_directory(
         BASE_TRAIN_DIR,
@@ -365,18 +468,17 @@ def main():
     )
 
     # Actively blend user-contributed images with base images
-    if len(x_user_train) > 0:
+    if blending:
         print("Blending user data into active training pipeline (25% user / 75% base per batch)...")
-        train_pipeline = create_blended_generator(
-            base_train_gen,
-            x_user_train,
-            y_user_train,
-            user_datagen=None,
-            batch_size=args.batch_size,
-            user_ratio=0.25
-        )
-    else:
-        train_pipeline = base_train_gen
+    train_pipeline = create_blended_generator(
+        base_train_gen,
+        x_user_train,
+        y_user_train,
+        user_datagen=None,
+        batch_size=args.batch_size,
+        user_ratio=user_ratio,
+        class_weight=class_weight_dict
+    )
 
     # Compile with low learning rate for gentle fine-tuning
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
@@ -413,6 +515,7 @@ def main():
     # -------------------------------------------------------------
     print("\nEvaluating Fine-Tuned Model on Test Set (`dataset/test`)...")
     new_acc, y_true, y_pred = evaluate_model_on_test(baseline_model, class_labels)
+    new_metrics = test_metrics(y_true, y_pred, len(class_labels))
     delta = new_acc - base_acc
     new_user_acc = evaluate_on_user_holdout(baseline_model, x_user_hold, y_user_hold)
 
@@ -420,6 +523,11 @@ def main():
     print("FINE-TUNING EVALUATION SUMMARY & SAFETY VERIFICATION")
     print("=" * 60)
     print(f"FER2013 Test Accuracy:   {base_acc*100:.2f}% -> {new_acc*100:.2f}%  ({'+' if delta >= 0 else ''}{delta*100:.2f} pp)")
+    f1_delta = new_metrics['macro_f1'] - base_metrics['macro_f1']
+    print(f"FER2013 Macro-F1:        {base_metrics['macro_f1']*100:.2f}% -> {new_metrics['macro_f1']*100:.2f}%  ({'+' if f1_delta >= 0 else ''}{f1_delta*100:.2f} pp)")
+    print("Per-class recall (FER2013):")
+    for label, r0, r1 in zip(class_labels, base_metrics['recall'], new_metrics['recall']):
+        print(f"  {label:<10} {r0*100:6.1f}% -> {r1*100:6.1f}%  ({'+' if r1 >= r0 else ''}{(r1 - r0)*100:.1f} pp)")
     if base_user_acc is not None:
         user_delta = new_user_acc - base_user_acc
         print(f"Your Held-Out Faces:     {base_user_acc*100:.2f}% -> {new_user_acc*100:.2f}%  ({'+' if user_delta >= 0 else ''}{user_delta*100:.2f} pp)")
@@ -427,21 +535,24 @@ def main():
         user_delta = None
         print("Your Held-Out Faces:     (not enough samples per class for a holdout; skipped)")
 
-    # Promotion rules: the model must not get worse on your own faces, and may lose at most
-    # --max_test_drop on FER2013 (the test set is a regression guard here, not a selection set).
-    test_ok = delta >= -args.max_test_drop
-    user_ok = (user_delta is None) or (user_delta >= 0)
-    promote = test_ok and user_ok
+    promote, reasons = promotion_decision(base_metrics, new_metrics, base_user_acc, new_user_acc, class_labels,
+                                          max_test_drop=args.max_test_drop, max_class_drop=args.max_class_drop)
 
     report_data = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "baseline_accuracy": base_acc,
         "finetuned_accuracy": new_acc,
         "accuracy_delta": delta,
+        "baseline_macro_f1": base_metrics["macro_f1"],
+        "finetuned_macro_f1": new_metrics["macro_f1"],
+        "baseline_recall": dict(zip(class_labels, base_metrics["recall"])),
+        "finetuned_recall": dict(zip(class_labels, new_metrics["recall"])),
+        "rejection_reasons": reasons,
         "baseline_user_holdout_accuracy": base_user_acc,
         "finetuned_user_holdout_accuracy": new_user_acc,
         "user_holdout_size": int(len(x_user_hold)),
         "max_test_drop": args.max_test_drop,
+        "max_class_drop": args.max_class_drop,
         "promoted": promote,
         "user_samples_count": counts,
         "epochs": args.epochs,
@@ -462,11 +573,6 @@ def main():
         print(f"Previous production weights backed up to: {BACKUP_MODEL_PATH}")
         print(f"New production weights promoted to: {MODEL_PATH}")
     else:
-        reasons = []
-        if not test_ok:
-            reasons.append(f"FER2013 accuracy dropped {abs(delta)*100:.2f} pp (limit {args.max_test_drop*100:.2f} pp)")
-        if not user_ok:
-            reasons.append(f"accuracy on your held-out faces dropped {abs(user_delta)*100:.2f} pp")
         print(f"\n[ROLLBACK SAFETY] Not promoted: {'; '.join(reasons)}.")
         print(f"Production weights in {MODEL_PATH} remain UNTOUCHED.")
         print(f"Fine-tuned candidate is preserved in {FINETUNED_MODEL_PATH} for inspection.")
