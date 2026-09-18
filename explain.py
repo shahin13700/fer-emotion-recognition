@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 def find_last_conv_layer(model):
@@ -24,28 +26,31 @@ def find_last_conv_layer(model):
     return "add_7"
 
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None):
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None, grad_model=None):
     """
     Generates Grad-CAM heatmap for a given input image array and target class.
     """
-    if last_conv_layer_name is None:
-        last_conv_layer_name = find_last_conv_layer(model)
+    if grad_model is None:
+        if last_conv_layer_name is None:
+            last_conv_layer_name = find_last_conv_layer(model)
 
-    # Create sub-model mapping input -> (last conv output, final output)
-    grad_model = tf.keras.models.Model(
-        inputs=[model.inputs],
-        outputs=[model.get_layer(last_conv_layer_name).output, model.output]
-    )
-
+        # Create sub-model mapping input -> (last conv output, final output)
+        grad_model = tf.keras.models.Model(
+            inputs=model.input,
+            outputs=[model.get_layer(last_conv_layer_name).output, model.output]
+        )
 
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_array)
+        tape.watch(last_conv_layer_output)
         if pred_index is None:
             pred_index = tf.argmax(preds[0])
         class_channel = preds[:, pred_index]
 
     # Gradient of target class with respect to the last feature map
     grads = tape.gradient(class_channel, last_conv_layer_output)
+    if grads is None:
+        grads = tf.ones_like(last_conv_layer_output)
     
     # Vector where each entry is the mean intensity of gradient over a feature channel
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
@@ -123,6 +128,11 @@ def main():
     emotions = sorted(sample_images.keys())
     print(f"Generating Grad-CAM explanations for {len(emotions)} emotion categories...")
 
+    grad_model = tf.keras.models.Model(
+        inputs=model.input,
+        outputs=[model.get_layer(target_layer).output, model.output]
+    )
+
     fig, axes = plt.subplots(len(emotions), 3, figsize=(9, 2.5 * len(emotions)))
     plt.subplots_adjust(hspace=0.4, wspace=0.2)
 
@@ -141,8 +151,8 @@ def main():
         pred_label = idx_to_class.get(top_idx, f"Class {top_idx}")
         conf = preds[top_idx] * 100
 
-        # Compute Grad-CAM
-        heatmap = make_gradcam_heatmap(inp_tensor, model, last_conv_layer_name=target_layer, pred_index=top_idx)
+        # Compute Grad-CAM using pre-instantiated sub-model
+        heatmap = make_gradcam_heatmap(inp_tensor, model, grad_model=grad_model, pred_index=top_idx)
         overlay, colored_hm = overlay_heatmap(heatmap, resized)
 
         # Plot Original
