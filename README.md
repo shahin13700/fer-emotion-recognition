@@ -87,7 +87,7 @@ source .venv/bin/activate       # On Linux/macOS
 pip install -r requirements.txt
 ```
 
-*(Pre-trained weights are included in `model/emotion_model.keras`, no training required. On Debian/Ubuntu without a desktop, `apt install libgl1 libglib2.0-0` for OpenCV; `packages.txt` does this on Hugging Face Spaces.)*
+*(Pre-trained weights are included in `model/emotion_model.keras`, no training required. On Debian/Ubuntu without a desktop, `apt install libgl1 libglib2.0-0 libegl1 libgles2` for OpenCV and the MediaPipe landmarker; `packages.txt` does this on Hugging Face Spaces.)*
 
 ### 2. Available Scripts
 
