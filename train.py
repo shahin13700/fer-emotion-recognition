@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, SeparableConv2D, BatchNormalization, Activation, MaxPooling2D, GlobalAveragePooling2D, Dense
+from tensorflow.keras.layers import Input, Conv2D, SeparableConv2D, BatchNormalization, Activation, MaxPooling2D, GlobalAveragePooling2D, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -85,9 +85,25 @@ def build_minixception(input_shape=(48, 48, 1), num_classes=7):
     x = tf.keras.layers.add([x, residual])
 
     # ---------------------------------------------------------
+    # Module 4
+    # ---------------------------------------------------------
+    residual = Conv2D(128, (1, 1), strides=(2, 2), padding='same', use_bias=False)(x)
+    residual = BatchNormalization()(residual)
+
+    x = SeparableConv2D(128, (3, 3), padding='same', use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = SeparableConv2D(128, (3, 3), padding='same', use_bias=False)(x)
+    x = BatchNormalization()(x)
+    
+    x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+    x = tf.keras.layers.add([x, residual])
+
+    # ---------------------------------------------------------
     # Classification Head
     # ---------------------------------------------------------
     x = GlobalAveragePooling2D()(x)
+    x = Dropout(0.5)(x)
     output = Dense(num_classes, activation='softmax')(x)
 
     model = Model(img_input, output)

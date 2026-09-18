@@ -473,36 +473,52 @@ def process_video_file(video_path, progress=gr.Progress()):
     if not video_path:
         return None
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap = None
+    out = None
+    temp_out = None
 
-    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_out.close()
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    smoothed_preds = None
-    frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        annotated_bgr, _, smoothed_preds, _ = annotate_frame(frame, smoothed_preds=smoothed_preds)
-        out.write(annotated_bgr)
+        temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_out.close()
         
-        frame_idx += 1
-        if frame_idx % 10 == 0:
-            progress(min(1.0, frame_idx / total_frames), desc=f"Processing video frame {frame_idx}/{total_frames}")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
 
-    cap.release()
-    out.release()
-    return temp_out.name
+        smoothed_preds = None
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            annotated_bgr, _, smoothed_preds, _ = annotate_frame(frame, smoothed_preds=smoothed_preds)
+            out.write(annotated_bgr)
+            
+            frame_idx += 1
+            if frame_idx % 10 == 0:
+                progress(min(1.0, frame_idx / total_frames), desc=f"Processing video frame {frame_idx}/{total_frames}")
+
+        return temp_out.name
+    except Exception as e:
+        if temp_out and os.path.exists(temp_out.name):
+            try:
+                os.remove(temp_out.name)
+            except Exception:
+                pass
+        raise e
+    finally:
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            out.release()
+
 
 
 # -------------------------------------------------------------
@@ -584,7 +600,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition") as d
                         gr.Markdown("#### 💾 Personal Dataset Builder for Fine-Tuning")
                         consent_box = gr.Checkbox(
                             label="Save captured face crops to dataset/user_contributed/ (stored locally on your machine for fine_tune.py)",
-                            value=True
+                            value=False
                         )
                         contribute_btn = gr.Button("💾 Save Captured Faces to Local Dataset", variant="secondary")
                         contribute_feedback = gr.Markdown("")

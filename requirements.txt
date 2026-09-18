@@ -24,5 +24,5 @@ seaborn==0.13.2
 scikit-learn==1.8.0
 
 # Testing & Continuous Integration
-pytest>=8.0.0
+pytest==9.1.1
 

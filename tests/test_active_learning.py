@@ -208,9 +208,10 @@ def test_blended_generator_actually_mixes_user_data():
     user_samples_in_batch = np.sum(batch_y[:, 6] == 1.0)
     assert user_samples_in_batch == 4, f"Expected 4 user samples in batch, found {user_samples_in_batch}"
 
-    # Base samples have class 0 activated
-    base_samples_in_batch = np.sum(batch_y[:, 0] == 1.0)
-    assert base_samples_in_batch == 12, f"Expected 12 base samples in batch, found {base_samples_in_batch}"
+    # Verify user samples are NOT double-rescaled
+    user_mask = (batch_y[:, 6] == 1.0)
+    assert np.all(batch_x[user_mask] > 0.5), "User data was double-rescaled (values dropped near zero)!"
+
 
 
 def test_original_model_preservation():

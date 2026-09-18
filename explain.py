@@ -12,15 +12,31 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 import matplotlib.pyplot as plt
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name="add_7", pred_index=None):
+def find_last_conv_layer(model):
+    """
+    Dynamically discovers the last residual (Add) or convolution layer in the model.
+    Prevents crashing if retrained with different layer names or module counts.
+    """
+    for layer in reversed(model.layers):
+        name = layer.name.lower()
+        if 'add' in name or 'separableconv' in name or 'conv2d' in name:
+            return layer.name
+    return "add_7"
+
+
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None):
     """
     Generates Grad-CAM heatmap for a given input image array and target class.
     """
+    if last_conv_layer_name is None:
+        last_conv_layer_name = find_last_conv_layer(model)
+
     # Create sub-model mapping input -> (last conv output, final output)
     grad_model = tf.keras.models.Model(
         inputs=[model.inputs],
         outputs=[model.get_layer(last_conv_layer_name).output, model.output]
     )
+
 
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_array)

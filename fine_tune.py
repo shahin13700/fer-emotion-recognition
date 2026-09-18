@@ -159,22 +159,37 @@ def load_and_preprocess_user_data(class_indices):
     return np.array(x_user, dtype=np.float32), np.array(y_user, dtype=np.float32)
 
 
-def create_blended_generator(base_gen, x_user, y_user, datagen, batch_size=32, user_ratio=0.25):
+def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_size=32, user_ratio=0.25):
     """
     Guardrail 2: Blended Generator that actively injects augmented user data
     into every training batch alongside base FER2013 samples.
+    
+    NOTE: x_user is already normalized to [0, 1] by load_and_preprocess_user_data.
+    We use user_datagen WITHOUT rescale so user images are NOT divided by 255 twice.
     """
     if len(x_user) == 0:
         return base_gen
 
+    if user_datagen is None:
+        user_datagen = ImageDataGenerator(
+            rotation_range=15,
+            zoom_range=0.15,
+            width_shift_range=0.10,
+            height_shift_range=0.10,
+            brightness_range=[0.85, 1.15],
+            horizontal_flip=True
+            # No rescale! x_user is already in [0, 1]
+        )
+
     user_batch_size = max(1, int(batch_size * user_ratio))
     base_batch_size = max(1, batch_size - user_batch_size)
 
-    user_flow = datagen.flow(
+    user_flow = user_datagen.flow(
         x_user, y_user,
         batch_size=user_batch_size,
         shuffle=True
     )
+
 
     def _generator():
         while True:
@@ -293,7 +308,7 @@ def main():
             base_train_gen,
             x_user_oversampled,
             y_user_oversampled,
-            train_datagen,
+            user_datagen=None,
             batch_size=args.batch_size,
             user_ratio=0.25
         )
