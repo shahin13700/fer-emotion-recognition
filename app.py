@@ -90,6 +90,30 @@ EMPIRICAL_THRESHOLDS = load_empirical_thresholds()
 # captured, and the slot is upgraded whenever a higher personal best comes along.
 MIN_CAPTURE_FLOOR = 0.25
 
+# EMA smoothing survives brief detection dropouts but is reset once the face has really
+# gone (~1 s), so one person's expression is never blended into the next person's frames.
+EMA_RESET_AFTER_MISSES = 30
+
+
+def ema_get(ema_state):
+    """The smoothed prediction vector held in a per-session EMA state (or None)."""
+    return ema_state.get("preds") if isinstance(ema_state, dict) else ema_state
+
+
+def ema_update(ema_state, new_preds, face_seen):
+    """
+    Advances the per-session EMA state: reset the miss counter on a detection, otherwise
+    count misses and drop the smoother once EMA_RESET_AFTER_MISSES frames passed without a face.
+    """
+    misses = ema_state.get("misses", 0) if isinstance(ema_state, dict) else 0
+    if face_seen:
+        return {"preds": new_preds, "misses": 0}
+    misses += 1
+    if misses >= EMA_RESET_AFTER_MISSES:
+        return {"preds": None, "misses": misses}
+    return {"preds": new_preds, "misses": misses}
+
+
 # Whole-image fallback in the photo tab is only for tiny pre-cropped faces
 # (FER2013 samples are 48x48). Larger images without a detected face are NOT classified.
 MAX_FALLBACK_SIZE = 128
@@ -129,7 +153,9 @@ def empty_slot():
         "train_crop": None,     # Tight Haar-box grayscale crop: exactly what the model classified
         "is_sample": False,     # Benchmark fallback face rather than a live capture
         "label_source": None,   # "model_argmax" or "user_corrected"
+        "model_label": None,    # What the model called it (kept when the user relabels)
         "saved": False,         # Already written to the local dataset (prevents duplicate saves)
+        "saved_path": None,     # File written by save_and_contribute, so a later relabel can retract it
     }
 
 
@@ -143,8 +169,10 @@ def slot_caption(emotion, slot):
     predict that emotion for them, so printing the reference score would read as a prediction."""
     if slot.get("is_sample"):
         return f"{emotion} (Sample)"
-    fixed = " (relabelled)" if slot.get("label_source") == "user_corrected" else ""
-    return f"{emotion}: {slot['score']*100:.0f}%{fixed}"
+    if slot.get("label_source") == "user_corrected":
+        # The score belonged to the model's (wrong) label; showing it here would misattribute it.
+        return f"{emotion} (relabelled)"
+    return f"{emotion}: {slot['score']*100:.0f}%"
 
 
 def gallery_items_from_state(booth_state):
@@ -191,6 +219,8 @@ def get_local_dataset_stats():
                         if line:
                             try:
                                 record = json.loads(line)
+                                if "event" in record:   # correction / retraction records are not samples
+                                    continue
                                 total_count += 1
                                 emo = record.get("emotion", "").capitalize()
                                 if emo in per_class:
@@ -335,7 +365,8 @@ def process_booth_frame(frame, booth_state, ema_state=None):
 
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     clean_bgr = frame_bgr.copy()
-    annotated_bgr, confs, ema_state, face_infos = annotate_frame(frame_bgr, smoothed_preds=ema_state)
+    annotated_bgr, confs, new_preds, face_infos = annotate_frame(frame_bgr, smoothed_preds=ema_get(ema_state))
+    ema_state = ema_update(ema_state, new_preds, bool(face_infos))
 
     new_capture = False
     # Only the primary (largest) face can fill the booth: bystanders in the background must
@@ -365,6 +396,7 @@ def process_booth_frame(frame, booth_state, ema_state=None):
                 "crop": crop_rgb,
                 "train_crop": info.get("train_crop"),
                 "label_source": "model_argmax",
+                "model_label": label,
             }
             new_capture = True
 
@@ -413,9 +445,30 @@ def relabel_slot(booth_state, from_emotion, to_emotion):
     src = booth_state.get(from_emotion)
     if src is None or src["crop"] is None or src["is_sample"]:
         return booth_state, gr.skip(), gr.skip(), f"⚠️ **{from_emotion}** has no live capture to relabel."
-    booth_state[to_emotion] = {**src, "label_source": "user_corrected", "saved": False}
+
+    retracted = ""
+    if src.get("saved") and src.get("saved_path"):
+        # The face is already on disk under the wrong label. Leaving it there would put the
+        # same face in two class folders with contradictory labels, so retract it: delete the
+        # file and append a correction record to the (append-only) log.
+        try:
+            if os.path.exists(src["saved_path"]):
+                os.remove(src["saved_path"])
+            with open(METADATA_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event": "relabel_retraction",
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "retracted_image_path": src["saved_path"],
+                    "old_emotion": from_emotion.lower(),
+                    "new_emotion": to_emotion.lower(),
+                }) + "\n")
+            retracted = f" The copy already saved as **{from_emotion}** was deleted; save again to store it as **{to_emotion}**."
+        except OSError as exc:
+            return booth_state, gr.skip(), gr.skip(), f"⚠️ Could not retract the saved file ({exc}); relabel aborted."
+
+    booth_state[to_emotion] = {**src, "label_source": "user_corrected", "saved": False, "saved_path": None}
     booth_state[from_emotion] = empty_slot()
-    msg = f"✏️ Moved the face captured as **{from_emotion}** into the **{to_emotion}** slot (label corrected by you)."
+    msg = f"✏️ Moved the face captured as **{from_emotion}** into the **{to_emotion}** slot (label corrected by you).{retracted}"
     return booth_state, challenge_status(booth_state), gallery_items_from_state(booth_state), msg
 
 
@@ -462,10 +515,14 @@ def save_and_contribute(booth_state, consent_given):
             train_crop = cv2.cvtColor(data["crop"], cv2.COLOR_RGB2GRAY)
         Image.fromarray(train_crop).save(img_path)
 
+        corrected = data.get("label_source") == "user_corrected"
         log_entry = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "emotion": emotion.lower(),
-            "score": round(float(data["score"]), 4),
+            # For a corrected label the model's score belongs to the model's label, not this one.
+            "score": None if corrected else round(float(data["score"]), 4),
+            "model_label": (data.get("model_label") or emotion).lower(),
+            "model_score": round(float(data["score"]), 4),
             "image_path": img_path.replace("\\", "/"),
             "label_source": data.get("label_source") or "model_argmax",
             "consent_given": True
@@ -475,6 +532,7 @@ def save_and_contribute(booth_state, consent_given):
             f.write(json.dumps(log_entry) + "\n")
 
         data["saved"] = True
+        data["saved_path"] = img_path
         saved_count += 1
 
     _, _, updated_banner = get_local_dataset_stats()
@@ -604,7 +662,8 @@ def process_live_frame(frame, ema_state=None):
         frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    annotated_bgr, confs, ema_state, _ = annotate_frame(frame_bgr, smoothed_preds=ema_state)
+    annotated_bgr, confs, new_preds, face_infos = annotate_frame(frame_bgr, smoothed_preds=ema_get(ema_state))
+    ema_state = ema_update(ema_state, new_preds, bool(face_infos))
     return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), confs, ema_state
 
 
@@ -723,7 +782,7 @@ def process_video_file(video_path, progress=gr.Progress()):
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(temp_out.name, fourcc, fps, (width, height))
 
-        smoothed_preds = None
+        ema_state = None
         frame_idx = 0
 
         while frame_idx < MAX_VIDEO_FRAMES:
@@ -733,7 +792,8 @@ def process_video_file(video_path, progress=gr.Progress()):
             if scale < 1.0:
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
-            annotated_bgr, _, smoothed_preds, _ = annotate_frame(frame, smoothed_preds=smoothed_preds)
+            annotated_bgr, _, new_preds, face_infos = annotate_frame(frame, smoothed_preds=ema_get(ema_state))
+            ema_state = ema_update(ema_state, new_preds, bool(face_infos))
             out.write(annotated_bgr)
 
             frame_idx += 1

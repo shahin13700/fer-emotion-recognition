@@ -288,11 +288,28 @@ def test_blended_generator_applies_class_weights_as_sample_weights():
     gen = fine_tune.create_blended_generator(base(), user_x, user_y, batch_size=8, user_ratio=0.25, class_weight=cw)
     x, y, w = next(gen)
     assert x.shape[0] == y.shape[0] == w.shape[0] == 8
-    assert np.allclose(w[y[:, 1] == 1], 9.4) and np.allclose(w[y[:, 3] == 1], 0.57)
+    # FER2013 share is class-balanced; user samples (disgust here) are NOT up-weighted 9.4x
+    assert np.allclose(w[y[:, 3] == 1], 0.57)
+    assert np.allclose(w[y[:, 1] == 1], 1.0)
 
     # Without user data the base stream is still weighted
     x, y, w = next(fine_tune.create_blended_generator(base(), np.empty((0, 48, 48, 1)), np.empty((0, 7)), class_weight=cw))
     assert np.allclose(w, 0.57)
+
+
+def test_train_scope_limits_trainable_layers():
+    """Default fine-tune scope trains only the classifier head; BatchNorm is frozen in every scope."""
+    m = tf.keras.models.load_model(fine_tune.MODEL_PATH)
+    total = m.count_params()
+    n_head = fine_tune.set_train_scope(m, "head")
+    head_params = sum(int(tf.size(w)) for w in m.trainable_weights)
+    assert n_head == 1 and head_params == 7 * 128 + 7
+    n_all = fine_tune.set_train_scope(m, "all")
+    all_params = sum(int(tf.size(w)) for w in m.trainable_weights)
+    assert n_all > n_head and head_params < all_params < total     # BN gamma/beta stay frozen
+    assert all(not l.trainable for l in m.layers if l.__class__.__name__ == "BatchNormalization")
+    with pytest.raises(ValueError):
+        fine_tune.set_train_scope(m, "everything")
 
 
 def test_split_user_holdout_is_per_class_and_deterministic():
@@ -418,7 +435,8 @@ def test_booth_crops_are_untainted(monkeypatch):
     assert captured_crop is not None
     cyan_pixels = np.all(captured_crop == [255, 230, 0], axis=-1)
     assert not np.any(cyan_pixels)
-    assert ema is not None and abs(float(ema[3]) - 0.95) < 1e-6
+    assert abs(float(app.ema_get(ema)[3]) - 0.95) < 1e-6
+    assert new_state["Happy"]["model_label"] == "Happy"
     # The tight training crop is the exact Haar box (60x60), grayscale, unpadded
     assert new_state["Happy"]["train_crop"].shape == (60, 60)
     assert new_state["Happy"]["label_source"] == "model_argmax"
@@ -441,16 +459,50 @@ def test_sample_fill_does_not_block_live_capture(monkeypatch):
 def test_relabel_slot_moves_capture_and_marks_correction():
     state = app.init_booth_state()
     state["Surprise"] = {**app.empty_slot(), "score": 0.6, "crop": np.zeros((30, 30, 3), np.uint8),
-                         "train_crop": np.zeros((30, 30), np.uint8), "label_source": "model_argmax", "saved": True}
+                         "train_crop": np.zeros((30, 30), np.uint8), "label_source": "model_argmax",
+                         "model_label": "Surprise"}
     state, status, gallery, msg = app.relabel_slot(state, "Surprise", "Fear")
     assert state["Surprise"]["crop"] is None
     assert state["Fear"]["crop"] is not None
     assert state["Fear"]["label_source"] == "user_corrected"
-    assert state["Fear"]["saved"] is False       # the corrected record still needs saving
-    assert "(relabelled)" in gallery[0][1]
+    assert state["Fear"]["model_label"] == "Surprise"
+    # The 60% belonged to the model's Surprise call; the corrected tile must not claim it
+    assert gallery[0][1] == "Fear (relabelled)"
     # Samples and empty slots cannot be relabelled
     state, _, _, msg = app.relabel_slot(state, "Happy", "Sad")
     assert "no live capture" in msg
+
+
+def test_relabel_after_save_retracts_the_wrongly_labelled_file(tmp_path, monkeypatch):
+    """Save -> relabel -> Save must leave ONE file, under the corrected label, with an audit trail."""
+    fake_contrib_dir = str(tmp_path / "user_contributed")
+    fake_jsonl = os.path.join(fake_contrib_dir, "metadata.jsonl")
+    monkeypatch.setattr(app, "USER_CONTRIB_DIR", fake_contrib_dir)
+    monkeypatch.setattr(app, "METADATA_JSONL", fake_jsonl)
+    monkeypatch.setattr(app, "ALLOW_LOCAL_SAVE", True)
+
+    state = app.init_booth_state()
+    state["Surprise"] = {**app.empty_slot(), "score": 0.6, "crop": np.zeros((30, 30, 3), np.uint8),
+                         "train_crop": np.full((30, 30), 9, np.uint8), "label_source": "model_argmax",
+                         "model_label": "Surprise"}
+    app.save_and_contribute(state, consent_given=True)
+    assert len(os.listdir(os.path.join(fake_contrib_dir, "surprise"))) == 1
+
+    state, _, _, msg = app.relabel_slot(state, "Surprise", "Fear")
+    assert "deleted" in msg
+    assert os.listdir(os.path.join(fake_contrib_dir, "surprise")) == []
+
+    feedback, _ = app.save_and_contribute(state, consent_given=True)
+    assert "Saved **1**" in feedback
+    assert len(os.listdir(os.path.join(fake_contrib_dir, "fear"))) == 1
+
+    records = [json.loads(l) for l in open(fake_jsonl, encoding="utf-8") if l.strip()]
+    assert [r.get("event", r.get("emotion")) for r in records] == ["surprise", "relabel_retraction", "fear"]
+    assert records[2]["label_source"] == "user_corrected"
+    assert records[2]["score"] is None and records[2]["model_label"] == "surprise" and records[2]["model_score"] == 0.6
+    # Stats count samples only, not the retraction event
+    total, per_class, _ = app.get_local_dataset_stats()
+    assert total == 1 and per_class["Fear"] == 1 and per_class["Surprise"] == 0
 
 
 def test_multi_face_temporal_smoothing_isolation(monkeypatch):
@@ -517,10 +569,18 @@ def test_live_stream_carries_ema_state(monkeypatch):
     assert abs(confs2["Angry"] - 0.70) < 1e-6
     assert abs(confs2["Happy"] - 0.30) < 1e-6
 
-    # A detection dropout keeps the smoother (so the next frame is not a raw, unsmoothed spike)
+    # A brief detection dropout keeps the smoother (so the next frame is not a raw, unsmoothed spike)...
     monkeypatch.setattr(app, "face_cascade", type("NoFace", (), {"detectMultiScale": lambda self, *a, **k: []})())
     _, confs3, ema3 = app.process_live_frame(frame, ema2)
-    assert confs3 == {} and np.array_equal(ema3, ema2)
+    assert confs3 == {} and np.array_equal(app.ema_get(ema3), app.ema_get(ema2)) and ema3["misses"] == 1
+    # ...but once the face has really gone the smoother is dropped, so the next person starts clean
+    state = ema3
+    for _ in range(app.EMA_RESET_AFTER_MISSES - 1):
+        _, _, state = app.process_live_frame(frame, state)
+    assert app.ema_get(state) is None
+    monkeypatch.setattr(app, "face_cascade", DummyCascade())
+    _, confs4, state = app.process_live_frame(frame, state)
+    assert abs(confs4["Angry"] - 1.0) < 1e-6 and state["misses"] == 0
 
 
 def test_dynamic_peak_expression_tracking(monkeypatch):

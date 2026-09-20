@@ -291,6 +291,37 @@ def evaluate_on_user_holdout(model_instance, x_hold, y_hold):
     return float(accuracy_score(np.argmax(y_hold, axis=1), np.argmax(preds, axis=1)))
 
 
+TRAIN_SCOPES = ("head", "last_block", "all")
+
+
+def set_train_scope(model_instance, scope="head"):
+    """
+    Limits which layers a fine-tune may change. The base model is converged, and unfreezing
+    everything lets a few hundred steps of personal data drift the minority classes (Sad
+    recall fell ~10 pp in every full-network trial). "head" trains only the classifier;
+    "last_block" also unfreezes the final residual block; "all" is the previous behaviour.
+    BatchNormalization layers stay frozen in every scope so running statistics do not move.
+    Returns the number of trainable layers.
+    """
+    if scope not in TRAIN_SCOPES:
+        raise ValueError(f"scope must be one of {TRAIN_SCOPES}")
+    layers = model_instance.layers
+    if scope == "all":
+        cutoff = 0
+    elif scope == "head":
+        cutoff = len(layers) - 1                      # Dense only
+    else:
+        # Last residual block starts after the previous Add layer
+        add_indices = [i for i, l in enumerate(layers) if l.__class__.__name__ == "Add"]
+        cutoff = (add_indices[-2] + 1) if len(add_indices) >= 2 else 0
+    n_trainable = 0
+    for i, layer in enumerate(layers):
+        is_bn = layer.__class__.__name__ == "BatchNormalization"
+        layer.trainable = (i >= cutoff) and not is_bn
+        n_trainable += int(layer.trainable and bool(layer.weights))
+    return n_trainable
+
+
 def sample_weights_for(y_batch, class_weight):
     """Per-sample weights from a {class_index: weight} dict (Keras 3 rejects class_weight for generators)."""
     idx = np.argmax(y_batch, axis=1)
@@ -305,8 +336,10 @@ def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_
 
     x_user must be RAW 0-255 pixels (see load_and_preprocess_user_data); the user
     datagen rescales to [0, 1] after augmentation, matching the base pipeline.
-    With class_weight, batches are yielded as (x, y, sample_weight) so the fine-tune
-    keeps the class balancing the base model was trained with.
+    With class_weight, batches are yielded as (x, y, sample_weight) so the FER2013 share
+    keeps the class balancing the base model was trained with. User samples always get
+    weight 1.0: the user set is balanced by construction (>= 10 per class), and applying
+    the ~9x Disgust weight to it yanks the minority classes hard on a converged model.
     """
     if len(x_user) == 0:
         if class_weight is None:
@@ -345,12 +378,13 @@ def create_blended_generator(base_gen, x_user, y_user, user_datagen=None, batch_
             # Shuffle combined batch
             indices = np.arange(len(merged_x))
             np.random.shuffle(indices)
-            merged_x, merged_y = merged_x[indices], merged_y[indices]
 
             if class_weight is None:
-                yield merged_x, merged_y
+                yield merged_x[indices], merged_y[indices]
             else:
-                yield merged_x, merged_y, sample_weights_for(merged_y, class_weight)
+                merged_w = np.concatenate([sample_weights_for(by, class_weight),
+                                           np.ones(len(user_x), dtype=np.float32)], axis=0)
+                yield merged_x[indices], merged_y[indices], merged_w[indices]
 
     return _generator()
 
@@ -361,11 +395,13 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Restore production model from pristine original baseline")
     parser.add_argument("--epochs", type=int, default=15, help="Number of fine-tuning epochs (default: 15)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size (default: 32)")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for fine-tuning (default: 5e-5)")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for fine-tuning (default: 1e-5; the base model is already converged)")
     parser.add_argument("--max_test_drop", type=float, default=MAX_TEST_DROP_DEFAULT,
                         help="Max allowed FER2013 accuracy / macro-F1 drop before rollback, as a fraction (default: 0.01)")
     parser.add_argument("--max_class_drop", type=float, default=MAX_CLASS_DROP_DEFAULT,
                         help="Max allowed per-class recall drop on FER2013, as a fraction (default: 0.03)")
+    parser.add_argument("--train_scope", choices=TRAIN_SCOPES, default="head",
+                        help="Layers to fine-tune: head (classifier only, default), last_block, or all")
     args = parser.parse_args()
 
     ensure_original_baseline()
@@ -480,6 +516,9 @@ def main():
         class_weight=class_weight_dict
     )
 
+    n_trainable = set_train_scope(baseline_model, args.train_scope)
+    print(f"Train scope: {args.train_scope} ({n_trainable} trainable layer(s); BatchNorm frozen)")
+
     # Compile with low learning rate for gentle fine-tuning
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
     baseline_model.compile(
@@ -495,7 +534,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("STARTING GUARDRAILED FINE-TUNING")
-    print(f"Epochs: {args.epochs} | LR: {args.lr} | Batch Size: {args.batch_size}")
+    print(f"Epochs: {args.epochs} | LR: {args.lr} | Batch Size: {args.batch_size} | Scope: {args.train_scope}")
     print("=" * 60)
 
     steps_per_epoch = len(base_train_gen)
@@ -556,7 +595,8 @@ def main():
         "promoted": promote,
         "user_samples_count": counts,
         "epochs": args.epochs,
-        "learning_rate": args.lr
+        "learning_rate": args.lr,
+        "train_scope": args.train_scope
     }
 
     with open(REPORT_PATH, 'w') as f:

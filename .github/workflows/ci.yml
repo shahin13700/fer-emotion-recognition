@@ -39,6 +39,12 @@ jobs:
         pip list --format=freeze | grep -i '^opencv' || true
         test "$(pip list --format=freeze | grep -ci '^opencv')" = "1"
 
+    - name: Cache MediaPipe Face Landmarker asset (avoids a network download per run)
+      uses: actions/cache@v4
+      with:
+        path: model/face_landmarker.task
+        key: face-landmarker-float16-v1
+
     - name: Syntax & Code Compilation
       run: |
         python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py scripts/calc_percentiles.py

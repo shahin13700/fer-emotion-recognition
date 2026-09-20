@@ -31,7 +31,7 @@ Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on
 - ⚡ **Fast CPU Inference:** Depthwise separable convolutions keep the model at 51k parameters. The forward pass is graph-compiled (`tf.function`), so a face costs **~2 ms** and a full 640×480 frame (Haar detection + classification) **~5 ms** on a desktop CPU (measured on a Ryzen 5000; your webcam and browser will bound the real frame rate).
 - 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge with **peak expression tracking**: any emotion scored above a 25% floor is captured, and each slot upgrades whenever you beat your personal best. Produces a downloadable **Emotion Photo Strip**. Only the largest (primary) face in frame is tracked, so bystanders never end up in your strip.
 - 💾 **Local Personal Dataset Builder:** Opt-in saving of your captured faces to `dataset/user_contributed/` (with an append-only `metadata.jsonl`) so you can adapt the model to your camera, lighting, and face. Labels default to the model's own top prediction (self-training), so the booth has a **relabel** control to correct them before saving; each capture is saved exactly once. **Automatically disabled on Hugging Face Spaces** so visitors' faces are never written to a shared server.
-- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Trains on the exact tight crops the model classified (no train/serve skew), blends them into every batch with augmentation and the same class-balanced weights as the base model, ignores byte-identical duplicates, requires ≥10 unique faces per class, and holds out 20% of your faces. A candidate is promoted only if it does not regress on your held-out faces, loses at most 1 pp accuracy and macro-F1 on FER2013, and no single class loses more than 3 pp recall. Previous weights are always backed up.
+- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Trains on the exact tight crops the model classified (no train/serve skew), blends them into every batch with augmentation (FER2013 share class-balanced, your faces unweighted), ignores byte-identical duplicates, requires ≥10 unique faces per class, and holds out 20% of your faces. By default only the classifier head is trainable (`--train_scope head|last_block|all`, BatchNorm always frozen). A candidate is promoted only if it does not regress on your held-out faces, loses at most 1 pp accuracy and macro-F1 on FER2013, and no single class loses more than 3 pp recall. Previous weights are always backed up. **Expect rejections:** the shipped checkpoint sits at a val-accuracy optimum, and in every proxy trial (FER2013 images standing in for a user) continued training lowered Sad recall by 5–12 pp, which the gate refuses. Loosen `--max_class_drop` only if you knowingly accept that trade for personalization, and judge runs by the held-out-faces number.
 - 👁️ **Fatigue & Drowsiness Guard:** Real-time **Eye Aspect Ratio (EAR)** from MediaPipe landmarks flags sustained eye closure. Uses the current MediaPipe Tasks API (`FaceLandmarker`); the ~3.7 MB landmark model is downloaded to `model/` on first run.
 - 🎯 **Temporal Smoothing:** EMA across consecutive frames in every live path (Gradio webcam tabs, `demo.py`, `monitor.py`, uploaded videos) reduces label flicker.
 - 🧠 **Explainable AI (Grad-CAM):** Coarse activation maps showing which region of the face drove a prediction.
@@ -114,7 +114,7 @@ pip install -r requirements.txt
 
 * **Local Active Learning Fine-Tuning** (requires FER2013 in `dataset/`, see below, plus ≥10 unique saved faces per class):
   ```bash
-  python fine_tune.py                 # --max_test_drop 0.01 --max_class_drop 0.03 by default
+  python fine_tune.py                 # defaults: --train_scope head --lr 1e-5 --max_test_drop 0.01 --max_class_drop 0.03
   python fine_tune.py --reset         # restore the original weights anytime
   ```
   The FER2013 test set acts as a regression guard here, which is a mild form of model selection on the test set; do not quote a post-fine-tune test accuracy as a benchmark result.
@@ -137,7 +137,8 @@ pip install -r requirements.txt
 - Saved crops go to `dataset/user_contributed/` on the machine running the app and are never uploaded by EdgeVision. Delete that folder to erase them. `dataset/` is git-ignored.
 - On Hugging Face Spaces (`SPACE_ID` set) saving is disabled by default because the "machine running the app" is a shared server. Set `EDGEVISION_ALLOW_SAVE=1` only on a private deployment you control.
 - Uploaded videos are capped (default 50 MB, first 1,800 frames, downscaled to 640 px). Annotated outputs and Gradio's own cached copies of uploads and results are purged after an hour (`gr.Blocks(delete_cache=...)`). Tune with `EDGEVISION_MAX_UPLOAD` and `EDGEVISION_MAX_VIDEO_FRAMES`.
-- Saved records carry `label_source` (`model_argmax` or `user_corrected`) and `consent_given`; nothing is "verified" beyond that.
+- Saved records carry `label_source` (`model_argmax` or `user_corrected`), `model_label`/`model_score`, and `consent_given`; nothing is "verified" beyond that. Relabelling an already-saved face deletes the wrongly-labelled file and appends a `relabel_retraction` record, so the same face never sits in two class folders.
+- Live smoothing state is per session and reset after ~1 s without a face, so one person's expression is never blended into the next person's frames.
 
 ---
 
@@ -178,7 +179,7 @@ pip install -r requirements.txt
 │   ├── empirical_thresholds.json  # Per-class confidence percentiles on correct test predictions
 │   └── gradcam_samples/           # Grad-CAM gallery
 ├── tests/
-│   └── test_active_learning.py    # Automated test suite (38 tests)
+│   └── test_active_learning.py    # Automated test suite (40 tests)
 ├── requirements.txt               # Pinned Python package dependencies
 ├── LICENSE                        # MIT License (code and weights)
 └── README.md
