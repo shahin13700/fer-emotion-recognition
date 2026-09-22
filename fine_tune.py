@@ -540,7 +540,7 @@ def main():
     steps_per_epoch = len(base_train_gen)
 
     # Train for specified epochs using blended pipeline
-    history = baseline_model.fit(
+    baseline_model.fit(
         train_pipeline,
         steps_per_epoch=steps_per_epoch,
         epochs=args.epochs,
@@ -616,7 +616,7 @@ def main():
         print(f"\n[ROLLBACK SAFETY] Not promoted: {'; '.join(reasons)}.")
         print(f"Production weights in {MODEL_PATH} remain UNTOUCHED.")
         print(f"Fine-tuned candidate is preserved in {FINETUNED_MODEL_PATH} for inspection.")
-        print(f"Note: You can restore pristine baseline anytime via: python fine_tune.py --reset")
+        print("Note: You can restore pristine baseline anytime via: python fine_tune.py --reset")
 
     print(f"Audit report written to {REPORT_PATH}.\n")
 
