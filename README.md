@@ -19,10 +19,27 @@ license: mit
 [![MediaPipe](https://img.shields.io/badge/MediaPipe-1.0-007ACC?logo=google&logoColor=white)](https://developers.google.com/mediapipe)
 [![Gradio](https://img.shields.io/badge/Gradio-Web%20App-orange?logo=gradio)](https://gradio.app/)
 [![Model Size](https://img.shields.io/badge/Model%20Size-817%20KB-brightgreen)]()
+[![Stars](https://img.shields.io/github/stars/shahin13700/fer-emotion-recognition?style=social)](https://github.com/shahin13700/fer-emotion-recognition)
 
 A lightweight, CPU-only computer vision pipeline for **real-time facial emotion recognition**, a **gamified photo booth**, and **driver drowsiness monitoring**. No GPU required.
 
+![EdgeVision Real-Time Demo](assets/demo.gif)
+
 Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on FER2013 with class-balanced weights, stabilized by **Exponential Moving Average (EMA) temporal smoothing**, and paired with the **Google MediaPipe Face Landmarker** (478 landmarks, Tasks API) for eye-closure detection.
+
+---
+
+### ⚡ Why EdgeVision?
+
+| Capability | Standard CNNs (ResNet-50 / VGG-16) | EdgeVision (MiniXception) | Advantage |
+| :--- | :---: | :---: | :--- |
+| **Model Size** | 90 MB – 500 MB | **817 KB** (51k params) | **>100× smaller footprint** |
+| **Hardware Required** | Discrete GPU recommended | **Low-power CPU** | Runs on laptops, Raspberry Pi, edge |
+| **Per-Face Latency** | 25 – 60 ms | **~2 ms** | Zero perceptible lag |
+| **Temporal Stability** | Unsmoothed (flickers frame-to-frame) | **EMA Temporal Smoothing** | Smooth, consistent emotion labels |
+| **Driver Safety** | Emotion only | **MediaPipe Fatigue Monitor (EAR)** | Dual-purpose: expression + drowsiness |
+| **Interactive UX** | Plain bounding boxes | **Gamified 7-Emotion Photo Booth** | Interactive challenge + downloadable strip |
+| **Privacy First** | Frequently server-bound | **100% Local / In-Memory** | Zero biometric uploads |
 
 ---
 

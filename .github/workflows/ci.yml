@@ -56,7 +56,7 @@ jobs:
 
     - name: Syntax & Code Compilation
       run: |
-        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py scripts/calc_percentiles.py
+        python -m py_compile app.py demo.py monitor.py explain.py train.py evaluate.py fine_tune.py scripts/calc_percentiles.py scripts/generate_demo_gif.py
 
     - name: Run Pytest Test Suite
       run: |

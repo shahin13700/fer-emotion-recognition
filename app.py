@@ -579,8 +579,9 @@ def generate_photo_strip(booth_state):
     tile_w, tile_h = 280, 280
     pad = 16
     header_h = 75
+    footer_h = 32
     total_w = (tile_w * 4) + (pad * 5)
-    total_h = header_h + (tile_h * 2) + (pad * 3)
+    total_h = header_h + (tile_h * 2) + (pad * 3) + footer_h
 
     canvas = Image.new('RGB', (total_w, total_h), color=(18, 22, 28))
     draw = ImageDraw.Draw(canvas)
@@ -633,6 +634,17 @@ def generate_photo_strip(booth_state):
     draw.text((stx + 20, sty + 112), f"Grade: {grade}", fill=(46, 204, 113), font=font_body)
     draw.text((stx + 20, sty + 176), "MiniXception 51k params / 817 KB", fill=(150, 150, 150), font=font_small)
     draw.text((stx + 20, sty + 200), "Real-Time CPU Inference", fill=(100, 100, 100), font=font_small)
+    draw.text((stx + 20, sty + 224), "github.com/shahin13700", fill=(0, 230, 255), font=font_small)
+
+    # Footer Branding Bar (attribution link on exported strips)
+    fy = total_h - footer_h
+    draw.rectangle([0, fy, total_w, total_h], fill=(12, 16, 22))
+    draw.text(
+        (pad + 10, fy + 8),
+        "🎭 Made with EdgeVision • Star on GitHub: github.com/shahin13700/fer-emotion-recognition • 817 KB CPU Real-Time AI",
+        fill=(110, 130, 155),
+        font=font_small
+    )
 
     return canvas
 
@@ -844,6 +856,7 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition", dele
         ### Real-Time Deep Learning using MiniXception (51k parameters, 817 KB, CPU-only)
 
         [![GitHub](https://img.shields.io/badge/GitHub-Repository-black?logo=github)](https://github.com/shahin13700/fer-emotion-recognition)
+        [![GitHub Stars](https://img.shields.io/github/stars/shahin13700/fer-emotion-recognition?style=social)](https://github.com/shahin13700/fer-emotion-recognition)
         [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
         [![Model Size](https://img.shields.io/badge/Model%20Size-817%20KB-brightgreen)]()
         """
@@ -905,6 +918,19 @@ with gr.Blocks(title="EdgeVision — Real-Time Facial Emotion Recognition", dele
                     gallery_output = gr.Gallery(label="✨ Unlocked Emotion Portraits", columns=4, height="auto")
                     generate_strip_btn = gr.Button("📸 Generate My Emotion Photo Strip", variant="primary", size="lg")
                     strip_output = gr.Image(label="Your Downloadable Emotion Photo Strip")
+
+                    # Open Source Star Callout
+                    gr.Markdown(
+                        """
+                        <div style="background: rgba(0, 230, 255, 0.05); border: 1px solid rgba(0, 230, 255, 0.2); border-radius: 8px; padding: 12px 16px; margin: 10px 0; text-align: center;">
+                            <div style="font-weight: 600; color: #00e6ff; margin-bottom: 4px;">Enjoyed the 7-Emotion Photo Booth Challenge? ⭐</div>
+                            <div style="font-size: 13px; color: #94a3b8; margin-bottom: 8px;">If you like this lightweight, zero-GPU edge vision project, show your support on GitHub!</div>
+                            <a href="https://github.com/shahin13700/fer-emotion-recognition" target="_blank" style="display: inline-block; background: #238636; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-weight: 600; text-decoration: none; font-size: 13px;">
+                                ⭐ Star EdgeVision on GitHub
+                            </a>
+                        </div>
+                        """
+                    )
 
                     # Active Learning Contribution Box
                     with gr.Group():
