@@ -1,14 +1,12 @@
 """
 Utility script to generate an animated demo GIF (assets/demo.gif)
-simulating real-time emotion tracking, photo booth progression,
-and drowsiness detection using the project's MiniXception model.
+simulating real-time emotion tracking and the 7-emotion photo booth challenge.
 """
 
 import os
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import tensorflow as tf
 
 def build_demo_gif(output_path="assets/demo.gif"):
     print("Generating animated demo GIF...")
@@ -38,7 +36,7 @@ def build_demo_gif(output_path="assets/demo.gif"):
         ("disgust.jpg", "Disgust", 0.75, (230, 126, 34)),
     ]
 
-    # Part 1: Simulate Photo Booth Emotion Progression (15 frames)
+    # Part 1: Simulate Photo Booth Emotion Progression (14 frames)
     unlocked = []
     for step, (img_name, emotion, conf, color) in enumerate(sample_emotions, 1):
         unlocked.append(emotion)
@@ -48,7 +46,7 @@ def build_demo_gif(output_path="assets/demo.gif"):
         else:
             face_img = Image.new("RGB", (180, 180), color=(40, 45, 55))
 
-        # Repeat each emotion 2 frames for smooth viewing
+        # 2 frames per emotion
         for sub in range(2):
             img = Image.new("RGB", (w, h), color=(15, 18, 24))
             draw = ImageDraw.Draw(img)
@@ -60,7 +58,6 @@ def build_demo_gif(output_path="assets/demo.gif"):
 
             # Left: Simulated Video Feed Box
             draw.rectangle([16, 52, 340, 340], fill=(26, 32, 42), outline=(50, 60, 75), width=2)
-            # Paste face centered in video feed
             img.paste(face_img, (88, 100))
 
             # Bounding box with emotion color
@@ -97,53 +94,43 @@ def build_demo_gif(output_path="assets/demo.gif"):
 
             frames.append(img)
 
-    # Part 2: Simulate Driver Fatigue Guard (4 frames)
-    for alert_cycle in range(3):
-        for is_alert in [True, False]:
-            img = Image.new("RGB", (w, h), color=(15, 18, 24))
-            draw = ImageDraw.Draw(img)
+    # Part 2: Challenge Complete & Generated Photo Strip Showcase (4 frames)
+    strip_path = os.path.join("assets", "sample_photo_strip.png")
+    strip_img = None
+    if os.path.exists(strip_path):
+        strip_raw = Image.open(strip_path).convert("RGB")
+        strip_img = strip_raw.resize((560, 260), Image.Resampling.LANCZOS)
 
-            # Header
-            draw.rectangle([0, 0, w, 40], fill=(35, 20, 20) if is_alert else (22, 27, 36))
-            draw.text((16, 10), "👁️ Driver Fatigue & Drowsiness Guard (MediaPipe EAR)", fill=(255, 90, 90) if is_alert else (0, 230, 255), font=font_large)
+    for i in range(4):
+        img = Image.new("RGB", (w, h), color=(15, 18, 24))
+        draw = ImageDraw.Draw(img)
 
-            # Left Video feed with Face Landmark simulation
-            draw.rectangle([16, 52, 340, 340], fill=(26, 32, 42), outline=(200, 50, 50) if is_alert else (50, 60, 75), width=2)
-            if os.path.exists("assets/samples/neutral.jpg"):
-                neut = Image.open("assets/samples/neutral.jpg").convert("RGB").resize((180, 180))
-                img.paste(neut, (88, 100))
+        # Header
+        draw.rectangle([0, 0, w, 40], fill=(22, 40, 32))
+        draw.text((16, 10), "🎉 CHALLENGE COMPLETED! 7 OF 7 EMOTIONS UNLOCKED", fill=(46, 204, 113), font=font_large)
+        draw.text((w - 180, 12), "Grade: PERFECT! 🏆", fill=(255, 215, 0), font=font_main)
 
-            # Eye landmark overlay indicators
-            draw.ellipse([135, 160, 155, 165], fill=(255, 50, 50) if is_alert else (0, 230, 255))
-            draw.ellipse([205, 160, 225, 165], fill=(255, 50, 50) if is_alert else (0, 230, 255))
+        # Showcase the Photo Strip in the center
+        if strip_img is not None:
+            img.paste(strip_img, (40, 60))
+            draw.rectangle([38, 58, 602, 322], outline=(0, 230, 255), width=2)
+        else:
+            draw.rectangle([40, 60, 600, 320], fill=(30, 36, 46))
+            draw.text((180, 180), "📸 Downloadable Emotion Photo Strip Ready", fill=(0, 230, 255), font=font_large)
 
-            if is_alert:
-                # Big flashing warning
-                draw.rectangle([20, 150, 336, 210], fill=(200, 20, 20))
-                draw.text((45, 168), "⚠️ DROWSINESS DETECTED!", fill=(255, 255, 255), font=font_large)
+        # Bottom Bar
+        draw.rectangle([0, 345, w, h], fill=(20, 24, 32))
+        draw.text((40, 360), "📸 1-Click Exportable Retro Photo Strip  •  100% In-Memory Privacy", fill=(180, 190, 205), font=font_main)
+        draw.text((w - 180, 360), "⭐ Star on GitHub", fill=(0, 230, 255), font=font_main)
 
-            # Right Telemetry
-            draw.rectangle([356, 52, w - 16, 340], fill=(20, 24, 32), outline=(40, 48, 62), width=1)
-            draw.text((370, 70), "DRIVER TELEMETRY", fill=(255, 255, 255), font=font_large)
-            draw.text((370, 110), "Eye Aspect Ratio (EAR):", fill=(180, 190, 205), font=font_main)
-            draw.text((370, 135), "0.14" if is_alert else "0.31", fill=(255, 75, 75) if is_alert else (46, 204, 113), font=font_large)
-            draw.text((430, 140), "(Threshold: < 0.22)", fill=(120, 130, 145), font=font_small)
+        frames.append(img)
 
-            draw.text((370, 180), "Closed Frame Counter:", fill=(180, 190, 205), font=font_main)
-            draw.text((370, 205), "24 frames (ALERT)" if is_alert else "0 frames (NORMAL)", fill=(255, 75, 75) if is_alert else (46, 204, 113), font=font_large)
-
-            draw.text((370, 260), "MediaPipe Face Landmarker", fill=(0, 230, 255), font=font_small)
-            draw.text((370, 280), "478 3D Landmarks • Real-Time", fill=(120, 130, 145), font=font_small)
-
-            draw.text((16, 365), "⚡ CPU-only monitoring with zero cloud dependencies", fill=(120, 140, 165), font=font_small)
-            frames.append(img)
-
-    # Save as animated GIF (duration=350ms per frame, loop indefinitely)
+    # Save as animated GIF (duration=400ms per frame, loop indefinitely)
     frames[0].save(
         output_path,
         save_all=True,
         append_images=frames[1:],
-        duration=380,
+        duration=420,
         loop=0,
         optimize=True
     )

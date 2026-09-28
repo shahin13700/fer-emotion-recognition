@@ -10,22 +10,21 @@ pinned: false
 license: mit
 ---
 
-# 🎭 EdgeVision: Real-Time Facial Emotion & Driver Fatigue Guard
+# 🎭 EdgeVision: Real-Time Facial Emotion Recognition & Gamified Photo Booth
 
 [![CI](https://github.com/shahin13700/fer-emotion-recognition/actions/workflows/ci.yml/badge.svg)](https://github.com/shahin13700/fer-emotion-recognition/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.16-FF6F00?logo=tensorflow&logoColor=white)](https://tensorflow.org/)
-[![MediaPipe](https://img.shields.io/badge/MediaPipe-1.0-007ACC?logo=google&logoColor=white)](https://developers.google.com/mediapipe)
 [![Gradio](https://img.shields.io/badge/Gradio-Web%20App-orange?logo=gradio)](https://gradio.app/)
 [![Model Size](https://img.shields.io/badge/Model%20Size-817%20KB-brightgreen)]()
 [![Stars](https://img.shields.io/github/stars/shahin13700/fer-emotion-recognition?style=social)](https://github.com/shahin13700/fer-emotion-recognition)
 
-A lightweight, CPU-only computer vision pipeline for **real-time facial emotion recognition**, a **gamified photo booth**, and **driver drowsiness monitoring**. No GPU required.
+A lightweight, CPU-only computer vision pipeline for **real-time facial emotion recognition**, an interactive **7-emotion photo booth challenge**, and **Grad-CAM explainability**. No GPU required.
 
 ![EdgeVision Real-Time Demo](assets/demo.gif)
 
-Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on FER2013 with class-balanced weights, stabilized by **Exponential Moving Average (EMA) temporal smoothing**, and paired with the **Google MediaPipe Face Landmarker** (478 landmarks, Tasks API) for eye-closure detection.
+Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on FER2013 with class-balanced weights, stabilized by **Exponential Moving Average (EMA) temporal smoothing**, and wrapped in an interactive **Gradio** web application.
 
 ---
 
@@ -37,7 +36,7 @@ Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on
 | **Hardware Required** | Discrete GPU recommended | **Low-power CPU** | Runs on laptops, Raspberry Pi, edge |
 | **Per-Face Latency** | 25 – 60 ms | **~2 ms** | Zero perceptible lag |
 | **Temporal Stability** | Unsmoothed (flickers frame-to-frame) | **EMA Temporal Smoothing** | Smooth, consistent emotion labels |
-| **Driver Safety** | Emotion only | **MediaPipe Fatigue Monitor (EAR)** | Dual-purpose: expression + drowsiness |
+| **Explainable AI** | Black-box output | **Grad-CAM Saliency Maps** | Visualizes which facial regions drove predictions |
 | **Interactive UX** | Plain bounding boxes | **Gamified 7-Emotion Photo Booth** | Interactive challenge + downloadable strip |
 | **Privacy First** | Frequently server-bound | **100% Local / In-Memory** | Zero biometric uploads |
 
@@ -47,12 +46,12 @@ Powered by a compact **MiniXception CNN** (51,255 parameters, 817 KB) trained on
 
 - ⚡ **Fast CPU Inference:** Depthwise separable convolutions keep the model at 51k parameters. The forward pass is graph-compiled (`tf.function`), so a face costs **~2 ms** and a full 640×480 frame (Haar detection + classification) **~5 ms** on a desktop CPU (measured on a Ryzen 5000; your webcam and browser will bound the real frame rate).
 - 📸 **7-Emotion Photo Booth Challenge:** Interactive webcam challenge with **peak expression tracking**: any emotion scored above a 25% floor is captured, and each slot upgrades whenever you beat your personal best. Produces a downloadable **Emotion Photo Strip**. Only the largest (primary) face in frame is tracked, so bystanders never end up in your strip.
-- 💾 **Local Personal Dataset Builder:** Opt-in saving of your captured faces to `dataset/user_contributed/` (with an append-only `metadata.jsonl`) so you can adapt the model to your camera, lighting, and face. Labels default to the model's own top prediction (self-training), so the booth has a **relabel** control to correct them before saving; each capture is saved exactly once. **Automatically disabled on Hugging Face Spaces** so visitors' faces are never written to a shared server.
-- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Trains on the exact tight crops the model classified (no train/serve skew), blends them into every batch with augmentation (FER2013 share class-balanced, your faces unweighted), ignores byte-identical duplicates, requires ≥10 unique faces per class, and holds out 20% of your faces. By default only the classifier head is trainable (`--train_scope head|last_block|all`, BatchNorm always frozen). A candidate is promoted only if it does not regress on your held-out faces, loses at most 1 pp accuracy and macro-F1 on FER2013, and no single class loses more than 3 pp recall. Previous weights are always backed up. **Expect rejections:** the shipped checkpoint sits at a val-accuracy optimum, and in every proxy trial (FER2013 images standing in for a user) continued training lowered Sad recall by 5–12 pp, which the gate refuses. Loosen `--max_class_drop` only if you knowingly accept that trade for personalization, and judge runs by the held-out-faces number.
-- 👁️ **Fatigue & Drowsiness Guard:** Real-time **Eye Aspect Ratio (EAR)** from MediaPipe landmarks flags sustained eye closure. Uses the current MediaPipe Tasks API (`FaceLandmarker`); the ~3.7 MB landmark model is downloaded to `model/` on first run.
-- 🎯 **Temporal Smoothing:** EMA across consecutive frames in every live path (Gradio webcam tabs, `demo.py`, `monitor.py`, uploaded videos) reduces label flicker.
-- 🧠 **Explainable AI (Grad-CAM):** Coarse activation maps showing which region of the face drove a prediction.
-- 🌐 **Interactive Web App (Gradio):** Photo booth, live webcam, video upload, and still-image tabs, ready for **Hugging Face Spaces**.
+- 🧠 **Explainable AI (Grad-CAM):** Coarse activation maps generated from the final residual block showing which regions of the face contributed most to a prediction.
+- 🎯 **Temporal Smoothing:** Exponential Moving Average (EMA) across consecutive frames in every live path (Gradio webcam tabs, `demo.py`, uploaded videos) eliminates label jitter and flicker.
+- 💾 **Local Personal Dataset Builder:** Opt-in saving of your captured faces to `dataset/user_contributed/` (with an append-only `metadata.jsonl`) so you can adapt the model to your camera, lighting, and face. Labels default to the model's own top prediction (self-training), with a **relabel** control to correct them before saving. **Automatically disabled on Hugging Face Spaces** so visitors' faces are never written to a shared server.
+- 🛡️ **Guardrailed Fine-Tuning (`fine_tune.py`):** Trains on the exact tight crops the model classified (no train/serve skew), blends them into every batch with augmentation, requires ≥10 unique faces per class, and holds out 20% of your faces. Promotes candidate weights only if they do not regress on your held-out faces and preserve benchmark accuracy.
+- 🌐 **Interactive Web App (Gradio):** Multi-modal web application featuring the Photo Booth, live webcam, video upload, and still-image analysis tabs.
+- 🚗 **Bonus Application Demo (`monitor.py`):** Demonstrates an automotive safety use case by pairing the emotion model with Google MediaPipe Face Landmarker (478 3D landmarks) for real-time Eye Aspect Ratio (EAR) driver fatigue detection.
 
 ### 📸 Photo Booth Session Strip
 The strip below was generated by the shipped code with the seven benchmark fallback faces (hence the `(SAMPLE)` tags). Sample tiles deliberately show no confidence number, because the model does not necessarily predict that emotion for them (see the Grad-CAM gallery); a live session shows your own captures with their real scores:
@@ -119,7 +118,7 @@ pip install -r requirements.txt
   python demo.py
   ```
 
-* **Driver Fatigue & Drowsiness Guard (MediaPipe):**
+* **Bonus Application — Driver Fatigue & Drowsiness Guard (MediaPipe):**
   ```bash
   python monitor.py    # downloads model/face_landmarker.task (3.7 MB) on first run, or set EDGEVISION_LANDMARKER_PATH
   ```
